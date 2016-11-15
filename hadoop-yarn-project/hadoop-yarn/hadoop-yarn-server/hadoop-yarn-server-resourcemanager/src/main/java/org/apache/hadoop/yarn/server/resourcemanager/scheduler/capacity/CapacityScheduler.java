@@ -300,8 +300,8 @@ public class CapacityScheduler extends
       IOException {
     this.conf = loadCapacitySchedulerConfiguration(configuration);
     validateConf(this.conf);
-    this.minimumAllocation = this.conf.getMinimumAllocation();
-    initMaximumResourceCapability(this.conf.getMaximumAllocation());
+    this.minimumAllocation = super.getMinimumAllocation();
+    initMaximumResourceCapability(super.getMaximumAllocation());
     this.calculator = this.conf.getResourceCalculator();
     this.usePortForNodeName = this.conf.getUsePortForNodeName();
     this.applications = new ConcurrentHashMap<>();

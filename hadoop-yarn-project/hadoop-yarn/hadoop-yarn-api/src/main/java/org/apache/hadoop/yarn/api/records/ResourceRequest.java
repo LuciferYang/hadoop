@@ -86,8 +86,18 @@ public abstract class ResourceRequest implements Comparable<ResourceRequest> {
   @Public
   @Evolving
   public static ResourceRequest newInstance(Priority priority, String hostName,
-      Resource capability, int numContainers, boolean relaxLocality, String
-      labelExpression, ExecutionTypeRequest executionTypeRequest) {
+      Resource capability, int numContainers, boolean relaxLocality,
+      String labelExpression, ExecutionTypeRequest executionTypeRequest) {
+    return newInstance(priority, hostName, capability, numContainers,
+        relaxLocality, labelExpression, executionTypeRequest, null);
+  }
+
+  @Public
+  @Evolving
+  public static ResourceRequest newInstance(Priority priority, String hostName,
+      Resource capability, int numContainers, boolean relaxLocality,
+      String labelExpression, ExecutionTypeRequest executionTypeRequest,
+      ProfileCapability profile) {
     ResourceRequest request = Records.newRecord(ResourceRequest.class);
     request.setPriority(priority);
     request.setResourceName(hostName);
@@ -96,6 +106,7 @@ public abstract class ResourceRequest implements Comparable<ResourceRequest> {
     request.setRelaxLocality(relaxLocality);
     request.setNodeLabelExpression(labelExpression);
     request.setExecutionTypeRequest(executionTypeRequest);
+    request.setProfileCapability(profile);
     return request;
   }
 
@@ -313,6 +324,14 @@ public abstract class ResourceRequest implements Comparable<ResourceRequest> {
   @Evolving
   public abstract void setNodeLabelExpression(String nodelabelExpression);
 
+  @Public
+  @Evolving
+  public abstract ProfileCapability getProfileCapability();
+
+  @Public
+  @Evolving
+  public abstract void setProfileCapability(ProfileCapability p);
+
   /**
    * Get the optional <em>ID</em> corresponding to this allocation request. This
    * ID is an identifier for different {@code ResourceRequest}s from the <b>same
@@ -372,11 +391,13 @@ public abstract class ResourceRequest implements Comparable<ResourceRequest> {
     Resource capability = getCapability();
     String hostName = getResourceName();
     Priority priority = getPriority();
+    ProfileCapability profile = getProfileCapability();
     result =
         prime * result + ((capability == null) ? 0 : capability.hashCode());
     result = prime * result + ((hostName == null) ? 0 : hostName.hashCode());
     result = prime * result + getNumContainers();
     result = prime * result + ((priority == null) ? 0 : priority.hashCode());
+    result = prime * result + ((profile == null) ? 0 : profile.hashCode());
     return result;
   }
 
