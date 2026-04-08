@@ -109,6 +109,35 @@ public class INodesInPath {
   }
 
   /**
+   * Construct an {@link INodesInPath} directly from a path component array
+   * and a pre-resolved INode array. Used by the FGL_IIP lock manager
+   * (HDFS-17492 / HDFS-17490) after its hand-over-hand walk has populated
+   * {@code inodes[]} under per-INode locks.
+   *
+   * <p>The caller is responsible for ensuring:
+   * <ul>
+   *   <li>{@code components.length == inodes.length}</li>
+   *   <li>Any trailing {@code inodes[i] == null} entries represent a
+   *       path whose target (or some ancestor onward) does not exist.
+   *       This matches the semantics of {@link #resolve} for partial
+   *       paths.</li>
+   * </ul>
+   *
+   * <p>The constructed IIP is a non-snapshot, non-raw path. Pilot scope
+   * excludes {@code .snapshot} and {@code /.reserved/raw} paths at the
+   * envelope level, so these defaults are correct for migrated RPCs.
+   */
+  @org.apache.hadoop.classification.InterfaceAudience.Private
+  public static INodesInPath fromComponentsAndInodes(byte[][] components,
+      INode[] inodes) {
+    Preconditions.checkArgument(components != null && inodes != null);
+    Preconditions.checkArgument(components.length == inodes.length,
+        "components.length=" + components.length
+            + " != inodes.length=" + inodes.length);
+    return new INodesInPath(inodes, components);
+  }
+
+  /**
    * Retrieve existing INodes from a path.  The number of INodes is equal
    * to the number of path components.  For a snapshot path
    * (e.g. /foo/.snapshot/s1/bar), the ".snapshot/s1" will be represented in
