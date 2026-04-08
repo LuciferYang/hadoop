@@ -282,4 +282,22 @@ public class FineGrainedFSNamesystemLock implements FSNLockManager {
   public ReentrantReadWriteLock getLockForTests() {
     throw new UnsupportedOperationException("SetLockTests is unsupported");
   }
+
+  /**
+   * @return the underlying FS-side {@link FSNamesystemLock}. Exposed
+   *         for the HDFS-17385 Phase II pilot, where
+   *         {@code IIPBasedFSNamesystemLock} composes this class and
+   *         reuses its FSLock as the "compat namespace lock" that
+   *         coordinates the IIP acquisition path with legacy
+   *         (un-migrated) callers.
+   *
+   *         <p>This is Phase I prerequisite P2 from the pilot design
+   *         spec §1.11. Only callers inside the {@code fgl} package
+   *         hierarchy should use this — returned by an accessor
+   *         marked {@code @InterfaceAudience.Private}.
+   */
+  @org.apache.hadoop.classification.InterfaceAudience.Private
+  public FSNamesystemLock getFsLock() {
+    return this.fsLock;
+  }
 }

@@ -19,9 +19,12 @@ package org.apache.hadoop.hdfs.server.namenode.fgl;
 
 import org.apache.hadoop.classification.VisibleForTesting;
 
+import java.io.IOException;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
 
+import org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPAcquireMode;
+import org.apache.hadoop.hdfs.server.namenode.fgl.iip.LockedIIP;
 import org.apache.hadoop.hdfs.util.RwLockMode;
 
 public interface FSNLockManager {
@@ -184,4 +187,47 @@ public interface FSNLockManager {
 
   @VisibleForTesting
   ReentrantReadWriteLock getLockForTests();
+
+  /**
+   * Acquire a path-scoped lock set for a migrated RPC (HDFS-17385
+   * Phase II pilot).
+   *
+   * <p>This method is the single entry point for pilot RPCs to acquire
+   * their lock state. Implementations are free to return a wrapper
+   * that holds legacy FS/BM locks (for {@code GlobalFSNamesystemLock}
+   * and {@code FineGrainedFSNamesystemLock}), or per-INode locks (for
+   * {@code IIPBasedFSNamesystemLock}). Callers use the returned handle
+   * via {@code try-with-resources}:
+   *
+   * <pre>
+   *   try (LockedIIP lip = fsLock.lockPath(path, mode)) {
+   *     // RPC body
+   *   }
+   * </pre>
+   *
+   * <p>The default implementation throws
+   * {@link UnsupportedOperationException} so that legacy
+   * {@link FSNLockManager} implementations (including downstream
+   * forks) are not required to implement this method until they
+   * choose to support the FGL_IIP path. In practice the only
+   * implementation that provides it is
+   * {@code IIPBasedFSNamesystemLock}; the Phase I and global managers
+   * will be extended separately if / when their unified path is
+   * migrated.
+   *
+   * @param path path to lock
+   * @param mode lock-acquisition mode
+   * @return a {@link LockedIIP} handle; caller must close exactly once
+   * @throws IOException          on path resolution or lock failure
+   * @throws InterruptedException if the caller is interrupted during
+   *                              acquisition
+   * @see <a href="file:../../../../../../../../../docs/fgl/HDFS-17385-wave4-pilot-design.md">
+   *      HDFS-17385 pilot design spec</a>
+   */
+  default LockedIIP lockPath(String path, IIPAcquireMode mode)
+      throws IOException, InterruptedException {
+    throw new UnsupportedOperationException(
+        "lockPath is not implemented by " + getClass().getName()
+            + "; only IIPBasedFSNamesystemLock provides it in the pilot");
+  }
 }
