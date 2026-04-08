@@ -63,8 +63,33 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
   /** parent is either an {@link INodeDirectory} or an {@link INodeReference}.*/
   private INode parent = null;
 
+  /**
+   * Version counter bumped on every {@link #setParent} /
+   * {@link #setParentReference} call. Used by {@link #getFullPathName()}
+   * to detect concurrent parent-chain mutations during a walk and retry
+   * (HDFS-17491, part of the HDFS-17385 Phase II pilot).
+   *
+   * <p>Single-writer invariant: this field is bumped only under a lock
+   * that serializes setParent calls on this INode. In FSLock / FGL modes
+   * the lock is the global / FS write lock. In FGL_IIP mode, {@code
+   * setParent} is called only from the fallback path (compat-write),
+   * which is mutually exclusive with migrated readers holding
+   * compat-read. Plain {@code ++} on a volatile int is therefore safe
+   * because there is no second concurrent writer.
+   *
+   * <p>Volatile semantics are used as the release/acquire fence that
+   * publishes the preceding {@code parent} write to readers: writers
+   * always execute {@code parent = x; parentVersion++;} in that order;
+   * a reader that observes a given {@code parentVersion} value also
+   * observes all writes that happened-before the version bump, in
+   * particular the corresponding {@code parent} write.
+   */
+  private volatile int parentVersion = 0;
+
   INode(INode parent) {
     this.parent = parent;
+    // Not bumping parentVersion here: the object is not yet published
+    // to other threads, so no reader can race with the constructor.
   }
 
   /** Get inode id */
@@ -598,27 +623,131 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
    */
   public abstract void setLocalName(byte[] name);
 
+  /**
+   * Maximum number of retry attempts for {@link #getFullPathName()}
+   * under concurrent parent-chain mutation. After exhausting attempts,
+   * a best-effort path is returned without verification — see the
+   * method Javadoc.
+   */
+  private static final int FULL_PATH_MAX_ATTEMPTS = 10;
+
+  /**
+   * Return the full path name of this inode.
+   *
+   * <p><b>Thread safety (HDFS-17491):</b> this method is safe to call
+   * concurrently with parent-chain mutations (e.g., rename). It walks
+   * up the parent chain collecting (INode, {@code parentVersion}) pairs,
+   * then re-reads every captured version at the end of the walk. If any
+   * version changed during the walk, the walk is retried up to
+   * {@link #FULL_PATH_MAX_ATTEMPTS} times.
+   *
+   * <p>If all attempts fail (pathological concurrent-rename rate), a
+   * best-effort walk is returned without verification. The returned
+   * path reflects a snapshot of the ancestor chain at some point during
+   * the walk and may not represent any single consistent state. This
+   * trade-off is acceptable for audit/log/error-message call sites
+   * where staleness is tolerable and extreme rename contention is not
+   * expected to be sustained. Callers that need strict consistency
+   * must hold a lock that excludes rename (e.g., compat-read under the
+   * pilot design).
+   *
+   * <p>See {@code docs/fgl/HDFS-17385-wave4-pilot-design.md} §2.8 for
+   * the full design rationale and JMM analysis.
+   */
   public String getFullPathName() {
-    // Get the full path name of this inode.
     if (isRoot()) {
       return Path.SEPARATOR;
     }
-    // compute size of needed bytes for the path
+
+    for (int attempt = 0; attempt < FULL_PATH_MAX_ATTEMPTS; attempt++) {
+      // Phase 1: walk, recording (INode, parentVersion) pairs.
+      // Read parentVersion BEFORE dereferencing parent on each hop so
+      // that a later volatile-read recheck can detect any mutation
+      // that happened during the walk.
+      INode[] chain = new INode[16];
+      int[] versions = new int[16];
+      int len = 0;
+      for (INode inode = this; inode != null; inode = inode.getParent()) {
+        if (len == chain.length) {
+          INode[] newChain = new INode[chain.length * 2];
+          int[] newVers = new int[versions.length * 2];
+          System.arraycopy(chain, 0, newChain, 0, len);
+          System.arraycopy(versions, 0, newVers, 0, len);
+          chain = newChain;
+          versions = newVers;
+        }
+        versions[len] = inode.parentVersion;   // volatile read (acquire)
+        chain[len] = inode;
+        len++;
+      }
+
+      // Phase 2: re-read every captured version. If any changed, we
+      // observed a mutation during the walk and must retry.
+      if (versionsStable(chain, versions, len)) {
+        return buildPathString(chain, len);
+      }
+      // Retry on version mismatch.
+    }
+
+    // Best-effort fallback: one more walk, returned without
+    // verification. See method Javadoc for the consistency contract.
+    return bestEffortFullPathName();
+  }
+
+  /**
+   * @return {@code true} if the current {@code parentVersion} on every
+   *         INode in {@code chain[0..len)} equals the corresponding
+   *         entry in {@code versions}, {@code false} otherwise.
+   */
+  private static boolean versionsStable(INode[] chain, int[] versions, int len) {
+    for (int i = 0; i < len; i++) {
+      if (chain[i].parentVersion != versions[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Build the concatenated '/'-joined path string from a chain of
+   * INodes walking leaf → root (as produced by
+   * {@link #getFullPathName()}).
+   */
+  private static String buildPathString(INode[] chain, int len) {
     int idx = 0;
-    for (INode inode = this; inode != null; inode = inode.getParent()) {
-      // add component + delimiter (if not tail component)
-      idx += inode.getLocalNameBytes().length + (inode != this ? 1 : 0);
+    for (int i = 0; i < len; i++) {
+      idx += chain[i].getLocalNameBytes().length + (i > 0 ? 1 : 0);
     }
     byte[] path = new byte[idx];
-    for (INode inode = this; inode != null; inode = inode.getParent()) {
-      if (inode != this) {
+    for (int i = 0; i < len; i++) {
+      if (i > 0) {
         path[--idx] = Path.SEPARATOR_CHAR;
       }
-      byte[] name = inode.getLocalNameBytes();
+      byte[] name = chain[i].getLocalNameBytes();
       idx -= name.length;
       System.arraycopy(name, 0, path, idx, name.length);
     }
     return DFSUtil.bytes2String(path);
+  }
+
+  /**
+   * Single unverified walk up the parent chain, used as the
+   * best-effort fallback when {@link #getFullPathName()} exhausts its
+   * retry budget. May return a path reflecting a mix of pre- and
+   * post-mutation state.
+   */
+  private String bestEffortFullPathName() {
+    INode[] chain = new INode[16];
+    int len = 0;
+    for (INode inode = this; inode != null; inode = inode.getParent()) {
+      if (len == chain.length) {
+        INode[] newChain = new INode[chain.length * 2];
+        System.arraycopy(chain, 0, newChain, 0, len);
+        chain = newChain;
+      }
+      chain[len++] = inode;
+    }
+    return buildPathString(chain, len);
   }
 
   public boolean isDeleted() {
@@ -683,18 +812,35 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
         + ", " + getParentString() + ")";
   }
 
-  /** @return the parent directory */
+  /**
+   * @return the parent directory.
+   *
+   * <p>Reads the {@link #parent} field exactly once into a local so
+   * that the null check, {@code isReference()} dispatch, and the final
+   * cast all operate on the same snapshot. Without this, a concurrent
+   * {@link #setParent} could observe a field value whose type changed
+   * between reads (INodeDirectory → INodeReference or vice-versa),
+   * causing a {@code ClassCastException}. Under pilot scope this race
+   * is latent — {@link #setParent} runs only under compat-write which
+   * excludes IIP readers — but the single-read shape is cheap and
+   * future-proofs the method for post-pilot rename migration.
+   */
   public final INodeDirectory getParent() {
-    return parent == null? null
-        : parent.isReference()? getParentReference().getParent(): parent.asDirectory();
+    INode p = parent;  // single read, captured to a local
+    if (p == null) {
+      return null;
+    }
+    return p.isReference() ? ((INodeReference) p).getParent() : p.asDirectory();
   }
 
   /**
    * @return the parent as a reference if this is a referred inode;
-   *         otherwise, return null.
+   *         otherwise, return null. Reads {@link #parent} exactly once
+   *         for the same reason as {@link #getParent()}.
    */
   public INodeReference getParentReference() {
-    return parent == null || !parent.isReference()? null: (INodeReference)parent;
+    INode p = parent;  // single read
+    return p == null || !p.isReference() ? null : (INodeReference) p;
   }
 
   /**
@@ -709,14 +855,28 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
     return ((WithCount)ref).getReferenceCount() == 1;
   }
 
-  /** Set parent directory */
+  /**
+   * Set parent directory.
+   *
+   * <p>Must be called under a lock that serializes setParent calls on
+   * this INode. The volatile write of {@link #parentVersion} published
+   * here acts as a release fence for the preceding plain write of
+   * {@link #parent}; concurrent readers of {@link #getFullPathName()}
+   * will observe the new parent (and retry or return best-effort).
+   */
   public final void setParent(INodeDirectory parent) {
     this.parent = parent;
+    this.parentVersion++;  // release fence for readers
   }
 
-  /** Set container. */
+  /**
+   * Set container.
+   *
+   * <p>See {@link #setParent(INodeDirectory)} for the threading contract.
+   */
   public final void setParentReference(INodeReference parent) {
     this.parent = parent;
+    this.parentVersion++;  // release fence for readers
   }
 
   /** Clear references to other objects. */
