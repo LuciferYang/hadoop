@@ -646,4 +646,64 @@ public class TestFSNamesystemFGLIIP {
       }
     }
   }
+
+  /**
+   * Hot-parent scenario: 16 threads create distinct children under the
+   * same parent. Exercises per-INode write lock contention on a shared
+   * parent — PARENT_WRITE serialises at the parent, so the checklist
+   * requires asserting this doesn't regress vs the legacy FGL path
+   * (which serialises on a global write lock).
+   */
+  @Test
+  @Timeout(120)
+  public void parallelMkdirsUnderSameParent() throws Exception {
+    final Path hot = new Path("/hot-mk-parent");
+    assertTrue(fs.mkdirs(hot));
+
+    final int numThreads = 16;
+    final int dirsPerThread = 30;
+    final AtomicInteger failures = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < dirsPerThread; i++) {
+              // Distinct child names per thread — no same-target race,
+              // but every call contends for the parent's write lock.
+              Path p = new Path(hot, "t" + tid + "_" + i);
+              if (!fs.mkdirs(p)) {
+                failures.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            failures.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, failures.get());
+
+    for (int t = 0; t < numThreads; t++) {
+      for (int i = 0; i < dirsPerThread; i++) {
+        Path p = new Path(hot, "t" + t + "_" + i);
+        assertTrue(fs.getFileStatus(p).isDirectory(),
+            "missing dir: " + p);
+      }
+    }
+  }
 }

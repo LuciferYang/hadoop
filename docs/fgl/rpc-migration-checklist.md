@@ -48,9 +48,9 @@ Every RPC migration to `FGL_IIP` mode must follow this checklist. Reviewers reje
 
 ## Testing
 
-- [ ] Test class uses `@ParameterizedTest @EnumSource(FSNamesystemLockMode.class)` for correctness cases.
-- [ ] All correctness test cases pass under all three modes (`GLOBAL`, `FGL`, `FGL_IIP`).
-- [ ] If the RPC has an envelope, each clause has an explicit miss test case with metric assertion (`CreateEnvelopeMissCount{clause=X}` incremented).
+- [ ] Pilot-specific tests live in `TestFSNamesystemFGLIIP` (FGL_IIP-only cluster). Tri-mode correctness coverage comes from the existing module test suite run under `-Dlockmode=FGL_IIP` per design-spec §4.8a — **not** from parameterising `TestFSNamesystemFGLIIP` itself. The `FSNamesystemLockMode` enum and `@EnumSource` harness referenced in earlier drafts of this checklist were never built; a future ticket may introduce them, at which point this item converts to "use the parameterised harness". Until then, pilot test classes remain FGL_IIP-only.
+- [ ] Existing test classes exercised by the RPC pass under `-Dlockmode=FGL`, `-Dlockmode=GLOBAL`, and `-Dlockmode=FGL_IIP`.
+- [ ] If the RPC **introduces a new envelope clause** (not reused from a prior pilot RPC), that clause has an explicit miss test case. Metric assertion (`CreateEnvelopeMissCount{clause=X}`) is deferred — the `FGLockMetrics` infrastructure is not yet implemented. File a follow-up ticket when the first RPC needs a genuinely new clause.
 - [ ] Concurrency test: at least one scenario with N=16 concurrent clients on disjoint INodes, asserting throughput scales near-linearly under `FGL_IIP`.
 - [ ] Concurrency test: at least one "hot" scenario (16 clients on shared INode) asserting no regression vs `FGL`.
 - [ ] Coverage on new code: ≥80% line, ≥75% branch.
@@ -58,7 +58,7 @@ Every RPC migration to `FGL_IIP` mode must follow this checklist. Reviewers reje
 
 ## Metrics
 
-- [ ] If the RPC adds a new envelope clause, a new enum value + counter registered in `FGLockMetrics` with the clause name.
+- [ ] If the RPC adds a new envelope clause, a new enum value + counter registered in `FGLockMetrics` with the clause name. **Note:** `FGLockMetrics` is not yet implemented; until the first RPC genuinely needs it, this item is deferred. File a prerequisite ticket to introduce `FGLockMetrics` if you are the first caller.
 - [ ] If the RPC has a new failure mode, a new counter or histogram registered.
 - [ ] If the RPC has a different latency profile, a new histogram dimension added.
 
