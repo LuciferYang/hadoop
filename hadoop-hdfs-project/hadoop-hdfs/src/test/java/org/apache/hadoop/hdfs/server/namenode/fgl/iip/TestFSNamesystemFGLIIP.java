@@ -134,9 +134,9 @@ public class TestFSNamesystemFGLIIP {
   @Timeout(60)
   public void createAndGetFileInfoDeepPath() throws Exception {
     Path parent = new Path("/a/b/c/d");
-    assertTrue(fs.mkdirs(parent),
-        "mkdirs should succeed (goes through legacy path; pilot doesn't "
-            + "handle mkdir)");
+    // Multi-level mkdir falls back to legacy because the pilot envelope
+    // only handles single-level creation (parent already exists).
+    assertTrue(fs.mkdirs(parent));
     Path p = new Path(parent, "deepfile");
     fs.create(p).close();
 
@@ -458,5 +458,192 @@ public class TestFSNamesystemFGLIIP {
       assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
     }
     assertEquals(0, errors.get());
+  }
+
+  // ======================================================================
+  // HDFS-17XXXX: mkdirs pilot path (PARENT_WRITE, single-level creation).
+  // ======================================================================
+
+  /** Shallow mkdir: parent = root, target absent. Pilot path handles. */
+  @Test
+  @Timeout(60)
+  public void mkdirsShallowUnderRoot() throws Exception {
+    Path p = new Path("/mk-shallow");
+    assertTrue(fs.mkdirs(p));
+    FileStatus status = fs.getFileStatus(p);
+    assertNotNull(status);
+    assertTrue(status.isDirectory());
+  }
+
+  /**
+   * Pre-existing parent, target absent — the single-level case the
+   * pilot envelope is designed for.
+   */
+  @Test
+  @Timeout(60)
+  public void mkdirsSingleLevelUnderExistingParent() throws Exception {
+    fs.mkdirs(new Path("/mk-parent"));  // sets up via fallback path
+    Path target = new Path("/mk-parent/child");
+    assertTrue(fs.mkdirs(target));
+    assertTrue(fs.getFileStatus(target).isDirectory());
+  }
+
+  /**
+   * mkdir on an existing directory is silent success in HDFS semantics.
+   * The pilot path must honour this without mutating state.
+   */
+  @Test
+  @Timeout(60)
+  public void mkdirsExistingDirectoryIsSilentSuccess() throws Exception {
+    Path p = new Path("/mk-already-exists");
+    assertTrue(fs.mkdirs(p));
+    // Second call must succeed silently under the pilot path.
+    assertTrue(fs.mkdirs(p));
+    assertTrue(fs.getFileStatus(p).isDirectory());
+  }
+
+  /** mkdir on a path that already exists as a file must fail. */
+  @Test
+  @Timeout(60)
+  public void mkdirsOnExistingFileFails() throws Exception {
+    Path p = new Path("/mk-file-collision");
+    fs.create(p).close();
+    assertThrows(FileAlreadyExistsException.class,
+        () -> fs.mkdirs(p));
+  }
+
+  /**
+   * Multi-level mkdir (missing intermediate ancestors) is an envelope
+   * miss — pilot returns null, legacy creates all levels. End-to-end
+   * result: success.
+   */
+  @Test
+  @Timeout(60)
+  public void mkdirsMultiLevelFallsBackToLegacy() throws Exception {
+    Path deep = new Path("/mk-deep/a/b/c/d");
+    assertTrue(fs.mkdirs(deep));
+    assertTrue(fs.getFileStatus(deep).isDirectory());
+    assertTrue(fs.getFileStatus(new Path("/mk-deep/a/b/c")).isDirectory());
+    assertTrue(fs.getFileStatus(new Path("/mk-deep/a")).isDirectory());
+  }
+
+  /** /.snapshot paths are envelope-rejected; legacy handles. */
+  @Test
+  @Timeout(60)
+  public void mkdirsSnapshotPathFallsBackToLegacy() throws Exception {
+    Path parent = new Path("/mk-snap-parent");
+    fs.mkdirs(parent);
+    fs.allowSnapshot(parent);
+    fs.createSnapshot(parent, "s1");
+    // Creating a directory under /.snapshot is forbidden by HDFS;
+    // legacy throws SnapshotAccessControlException. The pilot must
+    // not silently succeed — it must reject the path via envelope and
+    // let legacy raise the correct exception.
+    Path inSnap = new Path(parent, ".snapshot/s1/newdir");
+    assertThrows(IOException.class, () -> fs.mkdirs(inSnap));
+  }
+
+  /** /.reserved paths are envelope-rejected; legacy handles. */
+  @Test
+  @Timeout(60)
+  public void mkdirsReservedPathFallsBackToLegacy() throws Exception {
+    Path reserved = new Path("/.reserved/fake");
+    // Legacy should reject mkdir on /.reserved; we just assert the
+    // pilot didn't silently create the path.
+    assertThrows(IOException.class, () -> fs.mkdirs(reserved));
+  }
+
+  /**
+   * Traversal permission must be enforced. Non-owner lacking execute
+   * on an ancestor cannot mkdir a child — pilot's checkTraverse
+   * enforces this, mirroring U8b.
+   */
+  @Test
+  @Timeout(60)
+  public void mkdirsRespectsTraversalPermission() throws Exception {
+    Path restricted = new Path("/mk-perm/restricted");
+    fs.mkdirs(restricted);
+    fs.setPermission(restricted,
+        new org.apache.hadoop.fs.permission.FsPermission((short) 0700));
+
+    final org.apache.hadoop.security.UserGroupInformation other =
+        org.apache.hadoop.security.UserGroupInformation.createRemoteUser(
+            "mk-other-user");
+    final java.net.URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    other.doAs(
+        (java.security.PrivilegedExceptionAction<Void>) () -> {
+          DistributedFileSystem otherFs = (DistributedFileSystem)
+              FileSystem.get(clusterUri, otherConf);
+          try {
+            Path target = new Path(restricted, "child");
+            assertThrows(
+                org.apache.hadoop.security.AccessControlException.class,
+                () -> otherFs.mkdirs(target));
+          } finally {
+            otherFs.close();
+          }
+          return null;
+        });
+  }
+
+  /**
+   * Concurrent mkdirs across disjoint parents should not serialise on
+   * the compat lock. Under {@code PARENT_WRITE}, each call locks only
+   * its own parent, so disjoint-parent mkdirs proceed in parallel.
+   */
+  @Test
+  @Timeout(120)
+  public void parallelMkdirsAcrossDisjointParents() throws Exception {
+    final int numThreads = 8;
+    final int dirsPerThread = 20;
+    final AtomicInteger failures = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    for (int t = 0; t < numThreads; t++) {
+      assertTrue(fs.mkdirs(new Path("/pmk/p" + t)));
+    }
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < dirsPerThread; i++) {
+              Path p = new Path("/pmk/p" + tid + "/d" + i);
+              if (!fs.mkdirs(p)) {
+                failures.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            failures.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(60, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, failures.get());
+
+    for (int t = 0; t < numThreads; t++) {
+      for (int i = 0; i < dirsPerThread; i++) {
+        Path p = new Path("/pmk/p" + t + "/d" + i);
+        assertTrue(fs.getFileStatus(p).isDirectory(),
+            "missing dir: " + p);
+      }
+    }
   }
 }

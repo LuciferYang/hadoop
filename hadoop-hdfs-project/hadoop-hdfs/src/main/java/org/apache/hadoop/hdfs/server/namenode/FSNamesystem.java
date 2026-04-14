@@ -3899,24 +3899,168 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+
+    // HDFS-17385 Phase II pilot: try the FGL_IIP PARENT_WRITE path first
+    // when the cluster is running IIPBasedFSNamesystemLock and the call
+    // matches the scoped envelope (simple single-level create, no
+    // encryption zone on ancestors, no quota, default storage policy).
+    // On any envelope miss, fall through to the legacy writeLock(FS)
+    // path below.
+    boolean pilotHandled = false;
+    if (canUsePilotMkdirs(src)) {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot create directory " + src);
-        auditStat = FSDirMkdirOp.mkdirs(this, pc, src, permissions,
-            createParent);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        auditStat = mkdirsPilot(src, permissions, createParent, pc);
+        if (auditStat != null) {
+          pilotHandled = true;
+        }
+      } catch (org.apache.hadoop.hdfs.server.namenode.fgl.iip
+          .PilotEnvelopeMissException pem) {
+        // Envelope miss — fall through to legacy path.
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
+    }
+
+    if (!pilotHandled) {
+      try {
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot create directory " + src);
+          auditStat = FSDirMkdirOp.mkdirs(this, pc, src, permissions,
+              createParent);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
+      }
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
     return true;
+  }
+
+  /**
+   * Envelope-A (lock-free) check for the FGL_IIP {@code mkdirs} pilot.
+   * Returns {@code true} only for calls that have the simplest shape;
+   * Phase B checks (under held parent write lock) happen inside
+   * {@link #mkdirsPilot}.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
+   */
+  private boolean canUsePilotMkdirs(String src) {
+    if (!(fsLock instanceof
+        org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock)) {
+      return false;
+    }
+    if (src == null || src.isEmpty()) {
+      return false;
+    }
+    if (src.startsWith("/.reserved")) {
+      return false;
+    }
+    if (src.contains("/.snapshot")) {
+      return false;
+    }
+    // PARENT_WRITE requires a non-root path (at least 2 components).
+    if ("/".equals(src)) {
+      return false;
+    }
+    // If the NN has an encryption provider configured, ancestors may be
+    // under an encryption zone — envelope rejects the whole path-class
+    // conservatively. Post-pilot can narrow this.
+    if (provider != null) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * FGL_IIP path for {@code mkdirs}. Acquires {@code PARENT_WRITE} via
+   * the lock manager, runs Phase B envelope checks, and invokes the
+   * pre-resolved-IIP overload of {@link FSDirMkdirOp#mkdirsWithResolvedIIP}.
+   *
+   * <p>Pilot handles only single-level creation (immediate parent
+   * already exists). Multi-level creation via {@code createParent=true}
+   * with missing ancestors falls back to legacy because it would require
+   * acquiring write locks on non-existent ancestors.
+   *
+   * @return the audit {@link FileStatus} on success, or {@code null} if
+   *         the call should fall back to the legacy path due to an
+   *         envelope miss discovered under held locks
+   * @throws org.apache.hadoop.hdfs.server.namenode.fgl.iip
+   *         .PilotEnvelopeMissException on structural envelope misses
+   *         detected during the walk (symlink in ancestor, etc.)
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.10, §3.1
+   */
+  private FileStatus mkdirsPilot(String src, PermissionStatus permissions,
+      boolean createParent, FSPermissionChecker pc) throws IOException {
+    org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock iipLock =
+        (org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock) fsLock;
+    try (org.apache.hadoop.hdfs.server.namenode.fgl.iip.LockedIIP lip =
+        iipLock.lockPath(src,
+            org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPAcquireMode.PARENT_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot create directory " + src);
+
+      INodesInPath iip = lip.iip();
+
+      // Phase B envelope checks under held PARENT_WRITE. Any failure
+      // returns null to signal the caller to fall through to legacy.
+      INode parent = iip.length() >= 2 ? iip.getINode(-2) : null;
+      if (parent == null || !parent.isDirectory()) {
+        // Parent missing or not a directory — fall back so the legacy
+        // path can either createParent or throw the appropriate
+        // FileNotFoundException / ParentNotDirectoryException with the
+        // full multi-level creation logic.
+        return null;
+      }
+      INodeDirectory parentDir = parent.asDirectory();
+      if (parentDir.isWithQuota()) {
+        return null;
+      }
+      if (parentDir.getLocalStoragePolicyID()
+          != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
+        return null;
+      }
+      for (int i = 0; i < iip.length() - 1; i++) {
+        INode anc = iip.getINode(i);
+        if (anc == null) {
+          break;
+        }
+        if (anc.isDirectory()) {
+          INodeDirectory ad = anc.asDirectory();
+          if (ad.isWithQuota()) {
+            return null;
+          }
+          if (ad.getLocalStoragePolicyID()
+              != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
+            return null;
+          }
+        }
+      }
+
+      // Permission checks: traversal (execute) on every ancestor PLUS
+      // write on the parent. Mirrors FSDirMkdirOp.mkdirs which calls
+      // fsd.resolvePath(pc, src, DirOp.CREATE) (internally running
+      // checkTraverse) followed by checkAncestorAccess(WRITE) when the
+      // target is absent. The checkAncestorAccess call happens inside
+      // mkdirsWithResolvedIIP below.
+      dir.checkTraverse(pc, iip, DirOp.CREATE);
+
+      // createParent=false with missing parent was already handled
+      // (we fell back). With parent present, createParent=false is a
+      // no-op distinction.
+      return FSDirMkdirOp.mkdirsWithResolvedIIP(this, pc, iip, permissions);
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new java.io.InterruptedIOException(
+          "mkdirs interrupted on " + src);
+    }
   }
 
   /**

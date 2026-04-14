@@ -91,6 +91,68 @@ class FSDirMkdirOp {
   }
 
   /**
+   * FGL_IIP pilot overload. The caller (FSNamesystem.mkdirsPilot) has
+   * already acquired {@code PARENT_WRITE} on the target path via
+   * {@link org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock}
+   * and has verified the Phase B envelope (parent exists as a directory
+   * with default storage policy and no quota; target is either absent or
+   * already a directory).
+   *
+   * <p>This overload assumes single-level creation only — i.e., the
+   * immediate parent exists. Multi-level creation requires acquiring
+   * write locks on non-existent ancestors, which the pilot does not
+   * support.
+   *
+   * <p>Behavioural parity with the legacy overload:
+   * <ul>
+   *   <li>Target exists as a file: throws {@link FileAlreadyExistsException}.</li>
+   *   <li>Target exists as a directory: silent success, returns the
+   *       audit file info for the existing directory (legacy also
+   *       returns silently).</li>
+   *   <li>Target absent: creates a single directory under the parent
+   *       and returns the audit file info for the new directory.</li>
+   * </ul>
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.10, §3.1
+   */
+  static FileStatus mkdirsWithResolvedIIP(FSNamesystem fsn,
+      FSPermissionChecker pc, INodesInPath iip, PermissionStatus permissions)
+      throws IOException {
+    FSDirectory fsd = fsn.getFSDirectory();
+    if (NameNode.stateChangeLog.isDebugEnabled()) {
+      NameNode.stateChangeLog.debug(
+          "DIR* NameSystem.mkdirs (pilot): " + iip.getPath());
+    }
+    fsd.writeLock();
+    try {
+      final INode lastINode = iip.getLastINode();
+      if (lastINode != null && lastINode.isFile()) {
+        throw new FileAlreadyExistsException(
+            "Path is not a directory: " + iip.getPath());
+      }
+      if (lastINode != null) {
+        // Target already exists as a directory — legacy returns success
+        // silently without mutating state. Return the existing audit info.
+        return fsd.getAuditFileInfo(iip);
+      }
+      if (fsd.isPermissionEnabled()) {
+        fsd.checkAncestorAccess(pc, iip, FsAction.WRITE);
+      }
+      fsn.checkFsObjectLimit();
+      // Pilot envelope guarantees parent exists (caller verified).
+      INodesInPath parentIip = iip.getParentINodesInPath();
+      INodesInPath created = createSingleDirectory(
+          fsd, parentIip, iip.getLastLocalName(), permissions);
+      if (created == null) {
+        throw new IOException("Failed to create directory: " + iip.getPath());
+      }
+      return fsd.getAuditFileInfo(created);
+    } finally {
+      fsd.writeUnlock();
+    }
+  }
+
+  /**
    * For a given absolute path, create all ancestors as directories along the
    * path. All ancestors inherit their parent's permission plus an implicit
    * u+wx permission. This is used by create() and addSymlink() for
