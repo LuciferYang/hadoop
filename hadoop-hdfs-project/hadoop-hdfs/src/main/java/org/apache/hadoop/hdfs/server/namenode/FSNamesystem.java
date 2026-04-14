@@ -119,6 +119,10 @@ import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicyInfo;
 
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoStriped;
 import org.apache.hadoop.hdfs.server.namenode.fgl.FSNLockManager;
+import org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPAcquireMode;
+import org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock;
+import org.apache.hadoop.hdfs.server.namenode.fgl.iip.LockedIIP;
+import org.apache.hadoop.hdfs.server.namenode.fgl.iip.PilotEnvelopeMissException;
 import org.apache.hadoop.thirdparty.com.google.common.collect.Maps;
 import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotDeletionGc;
 import org.apache.hadoop.thirdparty.protobuf.ByteString;
@@ -153,6 +157,7 @@ import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -1076,8 +1081,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       // FSDirectory; capturing the root at injection time would leave
       // a stale reference. See round-6 BUG #2 fix and pilot design
       // spec §2.13 for the setter-injection rationale.
-      if (fsLock instanceof org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock) {
-        ((org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock)
+      if (fsLock instanceof IIPBasedFSNamesystemLock) {
+        ((IIPBasedFSNamesystemLock)
             fsLock).setFSDirectory(this.dir);
       }
       this.snapshotManager = new SnapshotManager(conf, dir);
@@ -2253,39 +2258,42 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     GetBlockLocationsResult res = null;
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    final INode inode;
-    try {
-      readLock(RwLockMode.GLOBAL);
+
+    // HDFS-17385 Phase II pilot: try the FGL_IIP PATH_READ path first
+    // when the cluster is running IIPBasedFSNamesystemLock and the
+    // path doesn't hit envelope-miss conditions. Fall through to the
+    // legacy GLOBAL read-lock path on any miss.
+    boolean pilotHandled = false;
+    if (canUsePilotGetBlockLocations(srcArg)) {
       try {
-        checkOperation(OperationCategory.READ);
-        res = FSDirStatAndListingOp.getBlockLocations(
-            dir, pc, srcArg, offset, length, true);
-        inode = res.getIIp().getLastINode();
-        if (isInSafeMode()) {
-          for (LocatedBlock b : res.blocks.getLocatedBlocks()) {
-            // if safemode & no block locations yet then throw safemodeException
-            if ((b.getLocations() == null) || (b.getLocations().length == 0)) {
-              SafeModeException se = newSafemodeException(
-                  "Zero blocklocations for " + srcArg);
-              if (haEnabled && haContext != null &&
-                  (haContext.getState().getServiceState() == ACTIVE ||
-                      haContext.getState().getServiceState() == OBSERVER)) {
-                throw new RetriableException(se);
-              } else {
-                throw se;
-              }
-            }
-          }
-        } else if (isObserver()) {
-          checkBlockLocationsWhenObserver(res.blocks, srcArg);
-        }
-      } finally {
-        readUnlock(RwLockMode.GLOBAL, operationName, getLockReportInfoSupplier(srcArg));
+        res = getBlockLocationsPilot(srcArg, offset, length, pc);
+        pilotHandled = true;
+      } catch (PilotEnvelopeMissException pem) {
+        // Envelope miss — fall through to legacy path.
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, srcArg);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, srcArg);
-      throw e;
     }
+
+    final INode inode;
+    if (!pilotHandled) {
+      try {
+        readLock(RwLockMode.GLOBAL);
+        try {
+          checkOperation(OperationCategory.READ);
+          res = FSDirStatAndListingOp.getBlockLocations(
+              dir, pc, srcArg, offset, length, true);
+          applySafemodeAndObserverChecks(res, srcArg);
+        } finally {
+          readUnlock(RwLockMode.GLOBAL, operationName, getLockReportInfoSupplier(srcArg));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, srcArg);
+        throw e;
+      }
+    }
+    inode = res.getIIp().getLastINode();
 
     logAuditEvent(true, operationName, srcArg);
 
@@ -2320,6 +2328,99 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     LocatedBlocks blocks = res.blocks;
     sortLocatedBlocks(clientMachine, blocks);
     return blocks;
+  }
+
+  /**
+   * Envelope-A (lock-free) check for the FGL_IIP
+   * {@code getBlockLocations} pilot path.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
+   */
+  private boolean canUsePilotGetBlockLocations(String src) {
+    if (!(fsLock instanceof
+        IIPBasedFSNamesystemLock)) {
+      return false;
+    }
+    if (src == null || src.isEmpty()) {
+      return false;
+    }
+    if (src.startsWith("/.reserved")) {
+      return false;
+    }
+    if (src.contains("/.snapshot")) {
+      return false;
+    }
+    if (provider != null) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * FGL_IIP path for {@code getBlockLocations}. Acquires
+   * {@code PATH_READ} via the lock manager, runs the permission check,
+   * and invokes the pre-resolved-IIP overload of
+   * {@link FSDirStatAndListingOp#getBlockLocations}. Under the same
+   * held lock, runs the safemode and observer checks that the legacy
+   * path runs before releasing the read lock. Access-time update is
+   * handled by the caller after the pilot lock is released (same phase
+   * as the legacy path).
+   *
+   * @throws PilotEnvelopeMissException on structural envelope misses
+   *         detected during the walk (symlink in ancestor, INode
+   *         reference, etc.)
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
+   */
+  private GetBlockLocationsResult getBlockLocationsPilot(String src,
+      long offset, long length, FSPermissionChecker pc) throws IOException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_READ)) {
+      checkOperation(OperationCategory.READ);
+      // BlockManager.createLocatedBlocks asserts BM read-lock held
+      // (checklist rule 4: IIPLock > BMLock; acquired under IIP and
+      // released before IIP closes).
+      readLock(RwLockMode.BM);
+      try {
+        GetBlockLocationsResult res = FSDirStatAndListingOp.getBlockLocations(
+            dir, pc, lip.iip(), src, offset, length, /* needBlockToken */ true);
+        applySafemodeAndObserverChecks(res, src);
+        return res;
+      } finally {
+        readUnlock(RwLockMode.BM, "getBlockLocations");
+      }
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException(
+          "getBlockLocations interrupted on " + src);
+    }
+  }
+
+  /**
+   * Run the post-read safemode and observer checks that the legacy
+   * {@code getBlockLocations} path runs while still holding the read
+   * lock. Shared between the legacy and pilot code paths so the two
+   * cannot diverge.
+   */
+  private void applySafemodeAndObserverChecks(GetBlockLocationsResult res,
+      String srcArg) throws IOException {
+    if (isInSafeMode()) {
+      for (LocatedBlock b : res.blocks.getLocatedBlocks()) {
+        // if safemode & no block locations yet then throw safemodeException
+        if ((b.getLocations() == null) || (b.getLocations().length == 0)) {
+          SafeModeException se = newSafemodeException(
+              "Zero blocklocations for " + srcArg);
+          if (haEnabled && haContext != null &&
+              (haContext.getState().getServiceState() == ACTIVE ||
+                  haContext.getState().getServiceState() == OBSERVER)) {
+            throw new RetriableException(se);
+          } else {
+            throw se;
+          }
+        }
+      }
+    } else if (isObserver()) {
+      checkBlockLocationsWhenObserver(res.blocks, srcArg);
+    }
   }
 
   private void sortLocatedBlocks(String clientMachine, LocatedBlocks blocks) {
@@ -2844,8 +2945,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
         if (stat != null) {
           return stat;
         }
-      } catch (org.apache.hadoop.hdfs.server.namenode.fgl.iip
-          .PilotEnvelopeMissException pem) {
+      } catch (PilotEnvelopeMissException pem) {
         // Envelope miss — fall through to legacy path.
       }
     }
@@ -2937,7 +3037,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
   private boolean canUsePilotStartFile(String src, EnumSet<CreateFlag> flag,
       String ecPolicyName, String storagePolicy) {
     if (!(fsLock instanceof
-        org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock)) {
+        IIPBasedFSNamesystemLock)) {
       return false;
     }
     if (src == null || src.isEmpty()) {
@@ -2979,8 +3079,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @return a fresh {@link HdfsFileStatus} on success, or {@code null}
    *         if the call should fall back to the legacy path due to an
    *         envelope miss discovered under held locks
-   * @throws org.apache.hadoop.hdfs.server.namenode.fgl.iip
-   *         .PilotEnvelopeMissException on structural envelope misses
+   * @throws PilotEnvelopeMissException on structural envelope misses
    *         detected during the walk (symlink in ancestor, etc.)
    */
   private HdfsFileStatus startFilePilot(String src,
@@ -2988,15 +3087,15 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       EnumSet<CreateFlag> flag, boolean createParent, short replication,
       long blockSize, FSPermissionChecker pc, boolean logRetryCache)
       throws IOException {
-    org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock iipLock =
-        (org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock) fsLock;
+    IIPBasedFSNamesystemLock iipLock =
+        (IIPBasedFSNamesystemLock) fsLock;
     boolean skipSync = true;
     HdfsFileStatus stat = null;
     BlocksMapUpdateInfo toRemoveBlocks = null;
 
-    try (org.apache.hadoop.hdfs.server.namenode.fgl.iip.LockedIIP lip =
+    try (LockedIIP lip =
         iipLock.lockPath(src,
-            org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPAcquireMode.PARENT_WRITE)) {
+            IIPAcquireMode.PARENT_WRITE)) {
       checkOperation(OperationCategory.WRITE);
       checkNameNodeSafeMode("Cannot create file" + src);
 
@@ -3095,7 +3194,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
     } catch (InterruptedException ie) {
       Thread.currentThread().interrupt();
-      throw new java.io.InterruptedIOException(
+      throw new InterruptedIOException(
           "startFile interrupted on " + src);
     } finally {
       if (!skipSync) {
@@ -3744,14 +3843,13 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     // legacy FS read-lock path on any miss.
     boolean pilotHandled = false;
     if (fsLock instanceof
-        org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock
+        IIPBasedFSNamesystemLock
         && canUsePilotGetFileInfo(src)) {
       try {
         stat = getFileInfoPilot(src, resolveLink, needLocation, needBlockToken,
             pc);
         pilotHandled = true;
-      } catch (org.apache.hadoop.hdfs.server.namenode.fgl.iip
-          .PilotEnvelopeMissException pem) {
+      } catch (PilotEnvelopeMissException pem) {
         // Fall through to legacy.
       } catch (AccessControlException e) {
         logAuditEvent(false, operationName, src);
@@ -3805,24 +3903,22 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
 
   /**
    * FGL_IIP path for {@code getFileInfo}. Acquires per-INode locks
-   * via {@link org.apache.hadoop.hdfs.server.namenode.fgl.iip
-   * .IIPBasedFSNamesystemLock#lockPath}, runs the traversal permission
+   * via {@link IIPBasedFSNamesystemLock#lockPath}, runs the traversal permission
    * check, and invokes the pre-resolved IIP overload of
    * {@link FSDirStatAndListingOp#getFileInfo}.
    *
-   * @throws org.apache.hadoop.hdfs.server.namenode.fgl.iip
-   *         .PilotEnvelopeMissException if the walk encounters a
+   * @throws PilotEnvelopeMissException if the walk encounters a
    *         structural condition the pilot cannot handle (caller
    *         falls back to legacy)
    */
   private HdfsFileStatus getFileInfoPilot(String src, boolean resolveLink,
       boolean needLocation, boolean needBlockToken, FSPermissionChecker pc)
       throws IOException {
-    org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock iipLock =
-        (org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock) fsLock;
-    try (org.apache.hadoop.hdfs.server.namenode.fgl.iip.LockedIIP lip =
+    IIPBasedFSNamesystemLock iipLock =
+        (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip =
         iipLock.lockPath(src,
-            org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPAcquireMode.PATH_READ)) {
+            IIPAcquireMode.PATH_READ)) {
       checkOperation(OperationCategory.READ);
       DirOp dirOp = resolveLink ? DirOp.READ : DirOp.READ_LINK;
       // Permission traversal check under held locks. Mirrors the
@@ -3857,7 +3953,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
           dir, lip.iip(), needLocation, needBlockToken);
     } catch (InterruptedException ie) {
       Thread.currentThread().interrupt();
-      throw new java.io.InterruptedIOException(
+      throw new InterruptedIOException(
           "getFileInfo interrupted on " + src);
     }
   }
@@ -3913,8 +4009,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
         if (auditStat != null) {
           pilotHandled = true;
         }
-      } catch (org.apache.hadoop.hdfs.server.namenode.fgl.iip
-          .PilotEnvelopeMissException pem) {
+      } catch (PilotEnvelopeMissException pem) {
         // Envelope miss — fall through to legacy path.
       } catch (AccessControlException e) {
         logAuditEvent(false, operationName, src);
@@ -3954,7 +4049,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    */
   private boolean canUsePilotMkdirs(String src) {
     if (!(fsLock instanceof
-        org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock)) {
+        IIPBasedFSNamesystemLock)) {
       return false;
     }
     if (src == null || src.isEmpty()) {
@@ -3992,18 +4087,17 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @return the audit {@link FileStatus} on success, or {@code null} if
    *         the call should fall back to the legacy path due to an
    *         envelope miss discovered under held locks
-   * @throws org.apache.hadoop.hdfs.server.namenode.fgl.iip
-   *         .PilotEnvelopeMissException on structural envelope misses
+   * @throws PilotEnvelopeMissException on structural envelope misses
    *         detected during the walk (symlink in ancestor, etc.)
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.10, §3.1
    */
   private FileStatus mkdirsPilot(String src, PermissionStatus permissions,
       boolean createParent, FSPermissionChecker pc) throws IOException {
-    org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock iipLock =
-        (org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock) fsLock;
-    try (org.apache.hadoop.hdfs.server.namenode.fgl.iip.LockedIIP lip =
+    IIPBasedFSNamesystemLock iipLock =
+        (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip =
         iipLock.lockPath(src,
-            org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPAcquireMode.PARENT_WRITE)) {
+            IIPAcquireMode.PARENT_WRITE)) {
       checkOperation(OperationCategory.WRITE);
       checkNameNodeSafeMode("Cannot create directory " + src);
 
@@ -4058,7 +4152,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       return FSDirMkdirOp.mkdirsWithResolvedIIP(this, pc, iip, permissions);
     } catch (InterruptedException ie) {
       Thread.currentThread().interrupt();
-      throw new java.io.InterruptedIOException(
+      throw new InterruptedIOException(
           "mkdirs interrupted on " + src);
     }
   }

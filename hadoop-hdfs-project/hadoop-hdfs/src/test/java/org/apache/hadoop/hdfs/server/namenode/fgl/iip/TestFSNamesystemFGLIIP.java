@@ -30,18 +30,30 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.io.FileNotFoundException;
+import java.net.URI;
+import java.security.PrivilegedExceptionAction;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.server.namenode.fgl.FSNLockManager;
+import org.apache.hadoop.security.AccessControlException;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -151,7 +163,7 @@ public class TestFSNamesystemFGLIIP {
     // DistributedFileSystem.getFileStatus throws FileNotFoundException
     // if the target doesn't exist.
     Path p = new Path("/does-not-exist");
-    assertThrows(java.io.FileNotFoundException.class,
+    assertThrows(FileNotFoundException.class,
         () -> fs.getFileStatus(p));
   }
 
@@ -210,7 +222,7 @@ public class TestFSNamesystemFGLIIP {
     // legacy path — both should return equivalent status.
     Path p = new Path("/reserved-test");
     fs.create(p).close();
-    org.apache.hadoop.hdfs.protocol.HdfsFileStatus first =
+    HdfsFileStatus first =
         fs.getClient().getFileInfo("/reserved-test");
     assertNotNull(first);
     long fileId = first.getFileId();
@@ -293,11 +305,11 @@ public class TestFSNamesystemFGLIIP {
 
     // Force a save + restart cycle that REPLACES the root INode.
     cluster.getNameNodeRpc().setSafeMode(
-        org.apache.hadoop.hdfs.protocol.HdfsConstants.SafeModeAction
+        HdfsConstants.SafeModeAction
             .SAFEMODE_ENTER, false);
     cluster.getNameNodeRpc().saveNamespace(0L, 0L);
     cluster.getNameNodeRpc().setSafeMode(
-        org.apache.hadoop.hdfs.protocol.HdfsConstants.SafeModeAction
+        HdfsConstants.SafeModeAction
             .SAFEMODE_LEAVE, false);
     cluster.restartNameNode();
     cluster.waitActive();
@@ -334,21 +346,21 @@ public class TestFSNamesystemFGLIIP {
     // Strip group/other access from "restricted" so non-owners can't
     // traverse through it. Owner (test user) keeps full access.
     fs.setPermission(restricted,
-        new org.apache.hadoop.fs.permission.FsPermission((short) 0700));
+        new FsPermission((short) 0700));
 
     // As a different user, try to create a file inside the
     // restricted subtree. The pilot path must reject via
     // checkTraverse.
-    final org.apache.hadoop.security.UserGroupInformation other =
-        org.apache.hadoop.security.UserGroupInformation.createRemoteUser(
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser(
             "other-user-without-traverse-perm");
-    final java.net.URI clusterUri = cluster.getURI();
+    final URI clusterUri = cluster.getURI();
     final Configuration otherConf = new HdfsConfiguration();
     otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
         IIPBasedFSNamesystemLock.class, FSNLockManager.class);
 
     other.doAs(
-        (java.security.PrivilegedExceptionAction<Void>) () -> {
+        (PrivilegedExceptionAction<Void>) () -> {
           DistributedFileSystem otherFs = (DistributedFileSystem)
               FileSystem.get(clusterUri, otherConf);
           try {
@@ -358,7 +370,7 @@ public class TestFSNamesystemFGLIIP {
               fail("BUG #1: pilot create should reject when an "
                   + "ancestor lacks execute permission for the "
                   + "current user");
-            } catch (org.apache.hadoop.security.AccessControlException
+            } catch (AccessControlException
                 expected) {
               // Pilot correctly rejected via checkTraverse.
             }
@@ -564,24 +576,24 @@ public class TestFSNamesystemFGLIIP {
     Path restricted = new Path("/mk-perm/restricted");
     fs.mkdirs(restricted);
     fs.setPermission(restricted,
-        new org.apache.hadoop.fs.permission.FsPermission((short) 0700));
+        new FsPermission((short) 0700));
 
-    final org.apache.hadoop.security.UserGroupInformation other =
-        org.apache.hadoop.security.UserGroupInformation.createRemoteUser(
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser(
             "mk-other-user");
-    final java.net.URI clusterUri = cluster.getURI();
+    final URI clusterUri = cluster.getURI();
     final Configuration otherConf = new HdfsConfiguration();
     otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
         IIPBasedFSNamesystemLock.class, FSNLockManager.class);
 
     other.doAs(
-        (java.security.PrivilegedExceptionAction<Void>) () -> {
+        (PrivilegedExceptionAction<Void>) () -> {
           DistributedFileSystem otherFs = (DistributedFileSystem)
               FileSystem.get(clusterUri, otherConf);
           try {
             Path target = new Path(restricted, "child");
             assertThrows(
-                org.apache.hadoop.security.AccessControlException.class,
+                AccessControlException.class,
                 () -> otherFs.mkdirs(target));
           } finally {
             otherFs.close();
@@ -705,5 +717,264 @@ public class TestFSNamesystemFGLIIP {
             "missing dir: " + p);
       }
     }
+  }
+
+  // ======================================================================
+  // getBlockLocations pilot path (PATH_READ).
+  // ======================================================================
+
+  /** Basic pilot read of a small file. */
+  @Test
+  @Timeout(60)
+  public void getBlockLocationsSingleBlock() throws Exception {
+    Path p = new Path("/bl-small");
+    byte[] data = new byte[1024];
+    Arrays.fill(data, (byte) 0x7f);
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(data);
+    }
+    LocatedBlocks blocks = fs.getClient().getLocatedBlocks(
+        p.toString(), 0L, Long.MAX_VALUE);
+    assertNotNull(blocks);
+    assertEquals(1, blocks.getLocatedBlocks().size());
+    assertEquals(data.length, blocks.getFileLength());
+  }
+
+  /**
+   * Multi-block file. The pilot must return every block with a valid
+   * location, identical to the legacy path.
+   */
+  @Test
+  @Timeout(60)
+  public void getBlockLocationsMultiBlock() throws Exception {
+    int blockBytes = 512;
+    Path p = new Path("/bl-multi");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+        blockBytes)) {
+      byte[] buf = new byte[blockBytes];
+      for (int i = 0; i < 3; i++) {
+        Arrays.fill(buf, (byte) i);
+        out.write(buf);
+      }
+    }
+    LocatedBlocks blocks = fs.getClient().getLocatedBlocks(
+        p.toString(), 0L, Long.MAX_VALUE);
+    assertNotNull(blocks);
+    assertEquals(3, blocks.getLocatedBlocks().size());
+    assertEquals(3L * blockBytes, blocks.getFileLength());
+    for (LocatedBlock lb : blocks.getLocatedBlocks()) {
+      assertTrue(lb.getLocations().length > 0,
+          "block must have at least one location");
+    }
+  }
+
+  /** getBlockLocations on a missing path throws FileNotFoundException. */
+  @Test
+  @Timeout(60)
+  public void getBlockLocationsOnMissingFileFails() throws Exception {
+    assertThrows(FileNotFoundException.class, () ->
+        fs.getClient().getLocatedBlocks("/bl-does-not-exist", 0L, 1L));
+  }
+
+  /** getBlockLocations on a directory fails (legacy semantics). */
+  @Test
+  @Timeout(60)
+  public void getBlockLocationsOnDirectoryFails() throws Exception {
+    Path dir = new Path("/bl-isdir");
+    fs.mkdirs(dir);
+    assertThrows(IOException.class, () ->
+        fs.getClient().getLocatedBlocks(dir.toString(), 0L, 1L));
+  }
+
+  /** Range within a file returns a subset of blocks. */
+  @Test
+  @Timeout(60)
+  public void getBlockLocationsWithRange() throws Exception {
+    int blockBytes = 512;
+    Path p = new Path("/bl-range");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+        blockBytes)) {
+      byte[] buf = new byte[blockBytes];
+      for (int i = 0; i < 3; i++) {
+        out.write(buf);
+      }
+    }
+    LocatedBlocks blocks = fs.getClient().getLocatedBlocks(
+        p.toString(), (long) blockBytes, (long) blockBytes);
+    assertNotNull(blocks);
+    assertTrue(blocks.getLocatedBlocks().size() >= 1);
+    assertTrue(blocks.getLocatedBlocks().size() <= 2,
+        "range within a single block should not return all 3");
+  }
+
+  /** /.snapshot paths are envelope-rejected; legacy handles them. */
+  @Test
+  @Timeout(60)
+  public void getBlockLocationsSnapshotPathFallsBackToLegacy()
+      throws Exception {
+    Path dir = new Path("/bl-snap-parent");
+    fs.mkdirs(dir);
+    fs.allowSnapshot(dir);
+    Path f = new Path(dir, "data");
+    try (FSDataOutputStream out = fs.create(f)) {
+      out.write(new byte[256]);
+    }
+    fs.createSnapshot(dir, "s1");
+
+    Path snapFile = new Path(dir, ".snapshot/s1/data");
+    LocatedBlocks blocks = fs.getClient().getLocatedBlocks(
+        snapFile.toString(), 0L, Long.MAX_VALUE);
+    assertNotNull(blocks,
+        "snapshot path should resolve via legacy fallback");
+    assertEquals(256L, blocks.getFileLength());
+  }
+
+  /** /.reserved/.inodes/<id> paths are envelope-rejected. */
+  @Test
+  @Timeout(60)
+  public void getBlockLocationsReservedPathFallsBackToLegacy()
+      throws Exception {
+    Path p = new Path("/bl-reserved");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[128]);
+    }
+    long fileId = fs.getClient().getFileInfo(p.toString()).getFileId();
+    String reserved = "/.reserved/.inodes/" + fileId;
+    LocatedBlocks blocks = fs.getClient().getLocatedBlocks(
+        reserved, 0L, Long.MAX_VALUE);
+    assertNotNull(blocks);
+    assertEquals(128L, blocks.getFileLength());
+  }
+
+  /** Non-owner lacking execute on ancestor cannot read block locations. */
+  @Test
+  @Timeout(60)
+  public void getBlockLocationsRespectsTraversalPermission()
+      throws Exception {
+    Path restricted = new Path("/bl-perm/restricted");
+    Path inner = new Path(restricted, "inner");
+    fs.mkdirs(inner);
+    Path f = new Path(inner, "data");
+    try (FSDataOutputStream out = fs.create(f)) {
+      out.write(new byte[64]);
+    }
+    fs.setPermission(restricted, new FsPermission((short) 0700));
+
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser("bl-other-user");
+    final URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    other.doAs(
+        (PrivilegedExceptionAction<Void>) () -> {
+          DistributedFileSystem otherFs = (DistributedFileSystem)
+              FileSystem.get(clusterUri, otherConf);
+          try {
+            assertThrows(AccessControlException.class,
+                () -> otherFs.getClient().getBlockLocations(
+                    f.toString(), 0L, 1L));
+          } finally {
+            otherFs.close();
+          }
+          return null;
+        });
+  }
+
+  /** Disjoint-files scale-out: 16 threads × 50 reads on distinct files. */
+  @Test
+  @Timeout(120)
+  public void parallelGetBlockLocationsDisjointFiles() throws Exception {
+    final int numThreads = 16;
+    final int requestsPerThread = 50;
+    for (int t = 0; t < numThreads; t++) {
+      Path p = new Path("/bl-parallel/f" + t);
+      try (FSDataOutputStream out = fs.create(p)) {
+        out.write(new byte[256]);
+      }
+    }
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < requestsPerThread; i++) {
+              LocatedBlocks lb = fs.getClient().getLocatedBlocks(
+                  "/bl-parallel/f" + tid, 0L, Long.MAX_VALUE);
+              if (lb == null || lb.getFileLength() != 256L) {
+                errors.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(60, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
+  }
+
+  /**
+   * Hot-file scenario: 16 threads hammer the same file. PATH_READ
+   * takes shared per-INode read locks; must not serialise or regress.
+   */
+  @Test
+  @Timeout(120)
+  public void parallelGetBlockLocationsOnSameFile() throws Exception {
+    Path p = new Path("/bl-hot");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[1024]);
+    }
+    final int numThreads = 16;
+    final int requestsPerThread = 100;
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < requestsPerThread; i++) {
+              LocatedBlocks lb = fs.getClient().getLocatedBlocks(
+                  p.toString(), 0L, Long.MAX_VALUE);
+              if (lb == null || lb.getFileLength() != 1024L) {
+                errors.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(60, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
   }
 }

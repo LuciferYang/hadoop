@@ -194,6 +194,57 @@ class FSDirStatAndListingOp {
     }
   }
 
+  /**
+   * FGL_IIP pilot overload. The caller (FSNamesystem.getBlockLocationsPilot)
+   * has already acquired {@code PATH_READ} on the target path via
+   * {@link org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock}
+   * and has verified the envelope (non-reserved, non-snapshot, no
+   * encryption provider). Assumes the target is present and resolves
+   * to a regular file.
+   *
+   * <p>Unlike the public overload, this does not call
+   * {@link FSDirectory#resolvePath} — the hand-over-hand walk has
+   * already populated the IIP under held per-INode read locks.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
+   */
+  static GetBlockLocationsResult getBlockLocations(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip, String src,
+      long offset, long length, boolean needBlockToken) throws IOException {
+    Preconditions.checkArgument(offset >= 0,
+        "Negative offset is not supported. File: " + src);
+    Preconditions.checkArgument(length >= 0,
+        "Negative length is not supported. File: " + src);
+    BlockManager bm = fsd.getBlockManager();
+    fsd.readLock();
+    try {
+      // Target must be a regular file. Mirrors legacy behaviour:
+      // FileNotFoundException when absent, IOException when directory.
+      final INodeFile inode = INodeFile.valueOf(iip.getLastINode(), src);
+      if (fsd.isPermissionEnabled()) {
+        fsd.checkUnreadableBySuperuser(pc, iip);
+        fsd.checkPathAccess(pc, iip, FsAction.READ);
+      }
+      // Pilot envelope rejects snapshot paths, so the "current state"
+      // overload is sufficient — no getPathSnapshotId branching.
+      final long fileSize = inode.computeFileSizeNotIncludingLastUcBlock();
+      final boolean isUc = inode.isUnderConstruction();
+      final FileEncryptionInfo feInfo =
+          FSDirEncryptionZoneOp.getFileEncryptionInfo(fsd, iip);
+      final ErasureCodingPolicy ecPolicy = FSDirErasureCodingOp
+          .unprotectedGetErasureCodingPolicy(fsd.getFSNamesystem(), iip);
+      final LocatedBlocks blocks = bm.createLocatedBlocks(
+          inode.getBlocks(Snapshot.CURRENT_STATE_ID), fileSize, isUc, offset,
+          length, needBlockToken, /* inSnapshot */ false, feInfo, ecPolicy);
+      final long now = now();
+      final boolean updateAccessTime = fsd.isAccessTimeSupported()
+          && now > inode.getAccessTime() + fsd.getAccessTimePrecision();
+      return new GetBlockLocationsResult(updateAccessTime, blocks, iip);
+    } finally {
+      fsd.readUnlock();
+    }
+  }
+
   private static byte getStoragePolicyID(byte inodePolicy, byte parentPolicy) {
     return inodePolicy != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED
         ? inodePolicy : parentPolicy;
