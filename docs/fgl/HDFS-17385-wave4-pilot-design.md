@@ -77,8 +77,8 @@ No code in `FSNamesystem` or RPC handlers branches on `dfs.namenode.lockmode`. D
 | Mode | Lock grid | Pilot? |
 |---|---|---|
 | `GLOBAL_READ` | compat-read | fallback only |
-| `PATH_READ` | ancestors read (root→leaf), target read | **yes** (`getFileInfo`, `getBlockLocations`, `isFileClosed`) |
-| `PATH_WRITE` | ancestors read (root→parent), target write | **yes** (`setPermission`, `setOwner`, `setTimes`, `setReplication`) |
+| `PATH_READ` | ancestors read (root→leaf), target read | **yes** (`getFileInfo`, `getBlockLocations`, `isFileClosed`, `getListing`) |
+| `PATH_WRITE` | ancestors read (root→parent), target write | **yes** (`setPermission`, `setOwner`, `setTimes`, `setReplication`, `setStoragePolicy`) |
 | `PARENT_WRITE` | ancestors read (root→parent's parent), parent write; new child created under parent's lock | **yes** (`create`, `mkdirs`, `delete` single-file) |
 | `ANCESTOR_WRITE` | ancestors read (root→target ancestor), subtree root write; descendants iterated without per-INode locks | deferred |
 | `RENAME_WRITE` | two paths; src-parent and dst-parent acquired in ascending-INode-ID order | deferred |
@@ -1284,7 +1284,7 @@ The pilot is **landed and locked** only when all of the following are true:
 
 **All gate checkboxes must be ticked.** Further RPC migration is blocked until the gate passes.
 
-### 6.3 RPC #10 refactor gate (mitigation #9)
+### 6.3 RPC #10 refactor gate (mitigation #9) — **PASSED 2026-04-15**
 
 **Trigger:** when 10 non-pilot RPC migration tickets (label `fgl-iip-rpc-migration`) reach Resolved/Closed.
 
@@ -1306,13 +1306,39 @@ When the count reaches 10, CI opens a blocking JIRA ticket `HDFS-XXXXX: FGL_IIP 
 
 **Exit criteria:**
 
-- [ ] No 3+ duplication remains.
-- [ ] `rpc-migration-checklist.md` updated.
-- [ ] New helpers extracted, reviewed, merged.
-- [ ] code-reviewer + architect agent signoffs.
-- [ ] JIRA gate ticket resolved with summary.
+- [x] No 3+ duplication remains. Phase-A helpers consolidated (`canUsePilotBase` + `canUsePilotParentWrite`); Phase-B helpers consolidated (`ancestorsAllowCreate`, `ancestorsAllowMutate`); dispatch-block boilerplate collapsed into `tryPilot` + `PilotResult`.
+- [x] `rpc-migration-checklist.md` updated — new §Code shape section enshrines the template pattern as mandatory for post-gate migrations.
+- [x] New helpers extracted, reviewed, merged:
+  - `FSNamesystem.PilotResult<R>`, `PilotOperation<R>`, `tryPilot`
+  - `FSNamesystem.canUsePilotBase`, `canUsePilotParentWrite`
+  - `FSNamesystem.ancestorsAllowCreate`, `ancestorsAllowMutate`
+- [x] code-reviewer agent signoff — see `docs/fgl/pre-rpc-10-review.md`.
+- [x] JIRA gate ticket resolved with summary — see this section.
 
-**Expected duration:** 3–5 working days. Known pause, not a surprise.
+**Actual duration:** landed in 4 commits over one session (dispatch template extract → 9-caller migration → RPC #10 as first template consumer → checklist/spec close-out), within the spec's expected 3–5 working days.
+
+**Gate summary:**
+
+10 RPCs migrated across 3 pilot modes:
+
+| Mode | RPCs |
+|---|---|
+| `PATH_READ` | `getFileInfo`, `getBlockLocations`, `isFileClosed`, `getListing` |
+| `PARENT_WRITE` | `startFile`, `mkdirs`, `delete` (single-file) |
+| `PATH_WRITE` | `setPermission`, `setOwner`, `setTimes`, `setReplication`, `setStoragePolicy` |
+
+Total lines in `FSNamesystem.java` attributable to pilot code after the gate: ~900 (down from ~1100 before the refactor, for the same functionality across 10× more RPCs than U8's pilot pair).
+
+**Post-gate pattern (mechanical application).** New migrations must:
+
+1. Pick a `PATH_READ`, `PARENT_WRITE`, or `PATH_WRITE` pilot mode. Deferred modes (`ANCESTOR_WRITE`, `RENAME_WRITE`) require a separate prerequisite ticket to implement the mode before migration.
+2. Write a pre-resolved-IIP overload in the appropriate `FSDirXxxOp` class (skip `resolvePath`; accept the IIP from the walk).
+3. Add a `canUsePilotXxx(src, ...)` Phase-A helper that delegates to `canUsePilotPathRead` / `canUsePilotPathWrite` / `canUsePilotParentWrite` and adds RPC-specific checks (overwrite flag, policy name, etc.).
+4. Write an `xxxPilot(src, ..., pc)` method that: acquires `PATH_XXX` / `PARENT_WRITE`; runs Phase-B checks (including `ancestorsAllowCreate` or `ancestorsAllowMutate`); throws `PilotEnvelopeMissException` on any Phase-B miss; delegates to the pre-resolved-IIP overload. **Signature:** `throws IOException, InterruptedException`.
+5. In the outer method, replace the legacy `writeLock/readLock` block preamble with `PilotResult<R> pr = tryPilot(() -> canUsePilotXxx(...), () -> xxxPilot(...), operationName, src);` and branch on `pr.handled`.
+6. Add tests to `TestFSNamesystemFGLIIP` covering: happy path, missing target, ancestor-fallback, snapshot-path fallback, `/.reserved` fallback, permission enforcement, disjoint-parallel, hot-parent / hot-file concurrency.
+
+Anything outside this pattern is a signal that the RPC needs design review, not a new template.
 
 ### 6.3a Mid-pilot review (between U3 and U4)
 

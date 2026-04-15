@@ -27,12 +27,55 @@ Every RPC migration to `FGL_IIP` mode must follow this checklist. Reviewers reje
 
 ## Code shape
 
+**Post-RPC-10 pattern (mandatory for all new migrations).** The §6.3 RPC-10 gate landed a shared dispatch template in `FSNamesystem`. Every new migration uses it. The shape is:
+
+```java
+// Outer method:
+final String operationName = "xxx";
+... standard setup ...
+PilotResult<R> pr = tryPilot(
+    () -> canUsePilotXxx(src),     // Phase A (lock-free)
+    () -> xxxPilot(src, ..., pc),   // Phase B (under IIP lock)
+    operationName, src);
+if (pr.handled) {
+  auditStat = pr.value;
+} else {
+  // legacy writeLock/readLock path unchanged
+}
+getEditLog().logSync();
+logAuditEvent(true, operationName, src, null, auditStat);
+
+// Pilot method:
+private R xxxPilot(String src, ..., FSPermissionChecker pc)
+    throws IOException, InterruptedException {
+  IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+  try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.MODE)) {
+    checkOperation(OperationCategory.XXX);
+    checkNameNodeSafeMode("Cannot xxx " + src);
+    INodesInPath iip = lip.iip();
+    // Phase-B checks — throw PilotEnvelopeMissException to fall back:
+    if (iip.getLastINode() == null) {
+      throw new PilotEnvelopeMissException("xxx: ... " + src);
+    }
+    if (!ancestorsAllowMutate(iip)) {  // or ancestorsAllowCreate
+      throw new PilotEnvelopeMissException("xxx: ... " + src);
+    }
+    // BMLock nested here if needed (rule 4).
+    return FSDirXxxOp.xxx(dir, pc, iip, ...);
+  }
+}
+```
+
+- [ ] Uses `tryPilot(...)` — no bespoke dispatch block.
+- [ ] Pilot method `throws IOException, InterruptedException` — template wraps `InterruptedException` into `InterruptedIOException`.
+- [ ] Pilot method throws `PilotEnvelopeMissException` on Phase-B miss — never `return null` to signal "fall back".
+- [ ] `null` returned from the pilot method means "legitimate null result" (e.g., `getFileInfo` file-not-found) — the template's `PilotResult.handled(null)` preserves this.
+- [ ] `auditOnAce=false` overload is used ONLY by `startFileInt` (its outer `startFile` wrapper owns ACE audit); every other RPC uses the default overload.
 - [ ] RPC body uses `try (LockedIIP lip = fsLock.lockPath(path, mode))` — no direct `fsLock.readLock/writeLock` calls.
 - [ ] RPC body does NOT touch `LockPool`, `LockRef`, or `INodeLockManager` directly — they are package-private by design.
 - [ ] No `if (lockMode == FGL_IIP) { ... } else { ... }` dispatch anywhere in the RPC body. Dispatch is virtual through `FSNLockManager.lockPath()`.
-- [ ] If the RPC needs an envelope (create-like), the envelope helper lives in `fgl.iip` and follows the two-phase shape from `CreatePilotEnvelope` — Phase A lock-free, Phase B under held target lock.
-- [ ] Envelope-miss delegation goes through `IIPBasedFSNamesystemLock.fallback().xxx(...)` — no re-entry of `lockPath`.
-- [ ] Edit log `logSync()` called OUTSIDE the `try-with-resources` block.
+- [ ] Envelope-miss delegation goes through the legacy fallback branch of the outer method — no re-entry of `lockPath`.
+- [ ] Edit log `logSync()` called OUTSIDE the `try-with-resources` block (in the outer method's shared tail).
 - [ ] Audit log `LOG.info` / `LOG.warn` called OUTSIDE the `try-with-resources` block (except trace-level debug inside the block).
 - [ ] No nested `lockPath` calls on the same thread. (The pilot forbids nesting; an assertion fires.)
 - [ ] BMLock, if acquired, is acquired AND released INSIDE the `try-with-resources` block but AFTER the IIP locks are held.
