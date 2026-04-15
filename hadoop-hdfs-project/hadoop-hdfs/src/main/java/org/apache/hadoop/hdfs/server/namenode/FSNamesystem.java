@@ -2199,26 +2199,14 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
 
-    // HDFS-17385 Phase II pilot: first PATH_WRITE migration. Pilot
-    // envelope handles the non-reserved / non-snapshot / simple-subtree
-    // case; anything else falls through to the legacy writeLock(FS)
-    // path below.
-    boolean pilotHandled = false;
-    if (canUsePilotPathWrite(src)) {
-      try {
-        auditStat = setPermissionPilot(src, permission, pc);
-        if (auditStat != null) {
-          pilotHandled = true;
-        }
-      } catch (PilotEnvelopeMissException pem) {
-        // Envelope miss — fall through to legacy path.
-      } catch (AccessControlException e) {
-        logAuditEvent(false, operationName, src);
-        throw e;
-      }
-    }
-
-    if (!pilotHandled) {
+    // HDFS-17385 Phase II pilot: FGL_IIP PATH_WRITE path.
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> setPermissionPilot(src, permission, pc),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
         writeLock(RwLockMode.FS);
         try {
@@ -2279,28 +2267,22 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
    */
   private FileStatus setPermissionPilot(String src, FsPermission permission,
-      FSPermissionChecker pc) throws IOException {
+      FSPermissionChecker pc) throws IOException, InterruptedException {
     IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
     try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
       checkOperation(OperationCategory.WRITE);
       checkNameNodeSafeMode("Cannot set permission for " + src);
-
       INodesInPath iip = lip.iip();
-
-      // Phase B envelope: target must exist and no snapshot
-      // involvement on any ancestor.
       if (iip.getLastINode() == null) {
-        return null;  // fall back — legacy produces the right FNE
+        throw new PilotEnvelopeMissException(
+            "setPermission: target does not exist " + src);
       }
       if (!ancestorsAllowMutate(iip)) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "setPermission: ancestor has snapshot/quota/storage-policy "
+                + src);
       }
-
       return FSDirAttrOp.setPermission(dir, pc, iip, permission);
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "setPermission interrupted on " + src);
     }
   }
 
@@ -2319,23 +2301,14 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
 
-    // HDFS-17385 Phase II pilot: PATH_WRITE path.
-    boolean pilotHandled = false;
-    if (canUsePilotPathWrite(src)) {
-      try {
-        auditStat = setOwnerPilot(src, username, group, pc);
-        if (auditStat != null) {
-          pilotHandled = true;
-        }
-      } catch (PilotEnvelopeMissException pem) {
-        // Envelope miss — fall through to legacy.
-      } catch (AccessControlException e) {
-        logAuditEvent(false, operationName, src);
-        throw e;
-      }
-    }
-
-    if (!pilotHandled) {
+    // HDFS-17385 Phase II pilot: FGL_IIP PATH_WRITE path.
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> setOwnerPilot(src, username, group, pc),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
         writeLock(RwLockMode.FS);
         try {
@@ -2366,25 +2339,21 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
    */
   private FileStatus setOwnerPilot(String src, String username, String group,
-      FSPermissionChecker pc) throws IOException {
+      FSPermissionChecker pc) throws IOException, InterruptedException {
     IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
     try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
       checkOperation(OperationCategory.WRITE);
       checkNameNodeSafeMode("Cannot set owner for " + src);
-
       INodesInPath iip = lip.iip();
       if (iip.getLastINode() == null) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "setOwner: target does not exist " + src);
       }
       if (!ancestorsAllowMutate(iip)) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "setOwner: ancestor has snapshot/quota/storage-policy " + src);
       }
-
       return FSDirAttrOp.setOwner(dir, pc, iip, username, group);
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "setOwner interrupted on " + src);
     }
   }
 
@@ -2400,25 +2369,14 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
 
-    // HDFS-17385 Phase II pilot: try the FGL_IIP PATH_READ path first
-    // when the cluster is running IIPBasedFSNamesystemLock and the
-    // path doesn't hit envelope-miss conditions. Fall through to the
-    // legacy GLOBAL read-lock path on any miss.
-    boolean pilotHandled = false;
-    if (canUsePilotPathRead(srcArg)) {
-      try {
-        res = getBlockLocationsPilot(srcArg, offset, length, pc);
-        pilotHandled = true;
-      } catch (PilotEnvelopeMissException pem) {
-        // Envelope miss — fall through to legacy path.
-      } catch (AccessControlException e) {
-        logAuditEvent(false, operationName, srcArg);
-        throw e;
-      }
-    }
-
-    final INode inode;
-    if (!pilotHandled) {
+    // HDFS-17385 Phase II pilot: FGL_IIP PATH_READ path.
+    PilotResult<GetBlockLocationsResult> pr = tryPilot(
+        () -> canUsePilotPathRead(srcArg),
+        () -> getBlockLocationsPilot(srcArg, offset, length, pc),
+        operationName, srcArg);
+    if (pr.handled) {
+      res = pr.value;
+    } else {
       try {
         readLock(RwLockMode.GLOBAL);
         try {
@@ -2434,7 +2392,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
         throw e;
       }
     }
-    inode = res.getIIp().getLastINode();
+    final INode inode = res.getIIp().getLastINode();
 
     logAuditEvent(true, operationName, srcArg);
 
@@ -2487,7 +2445,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
    */
   private GetBlockLocationsResult getBlockLocationsPilot(String src,
-      long offset, long length, FSPermissionChecker pc) throws IOException {
+      long offset, long length, FSPermissionChecker pc)
+      throws IOException, InterruptedException {
     IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
     try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_READ)) {
       checkOperation(OperationCategory.READ);
@@ -2503,10 +2462,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       } finally {
         readUnlock(RwLockMode.BM, "getBlockLocations");
       }
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "getBlockLocations interrupted on " + src);
     }
   }
 
@@ -2606,23 +2561,14 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
 
-    // HDFS-17385 Phase II pilot: PATH_WRITE path.
-    boolean pilotHandled = false;
-    if (canUsePilotPathWrite(src)) {
-      try {
-        auditStat = setTimesPilot(src, mtime, atime, pc);
-        if (auditStat != null) {
-          pilotHandled = true;
-        }
-      } catch (PilotEnvelopeMissException pem) {
-        // Envelope miss — fall through to legacy.
-      } catch (AccessControlException e) {
-        logAuditEvent(false, operationName, src);
-        throw e;
-      }
-    }
-
-    if (!pilotHandled) {
+    // HDFS-17385 Phase II pilot: FGL_IIP PATH_WRITE path.
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> setTimesPilot(src, mtime, atime, pc),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
         writeLock(RwLockMode.FS);
         try {
@@ -2651,25 +2597,21 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
    */
   private FileStatus setTimesPilot(String src, long mtime, long atime,
-      FSPermissionChecker pc) throws IOException {
+      FSPermissionChecker pc) throws IOException, InterruptedException {
     IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
     try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
       checkOperation(OperationCategory.WRITE);
       checkNameNodeSafeMode("Cannot set times " + src);
-
       INodesInPath iip = lip.iip();
       if (iip.getLastINode() == null) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "setTimes: target does not exist " + src);
       }
       if (!ancestorsAllowMutate(iip)) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "setTimes: ancestor has snapshot/quota/storage-policy " + src);
       }
-
       return FSDirAttrOp.setTimes(dir, pc, iip, mtime, atime);
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "setTimes interrupted on " + src);
     }
   }
 
@@ -2780,24 +2722,14 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
 
-    // HDFS-17385 Phase II pilot: PATH_WRITE path with nested BM lock.
-    boolean pilotHandled = false;
-    if (canUsePilotPathWrite(src)) {
-      try {
-        Boolean pilotRet = setReplicationPilot(src, replication, pc);
-        if (pilotRet != null) {
-          success = pilotRet;
-          pilotHandled = true;
-        }
-      } catch (PilotEnvelopeMissException pem) {
-        // Envelope miss — fall through to legacy.
-      } catch (AccessControlException e) {
-        logAuditEvent(false, operationName, src);
-        throw e;
-      }
-    }
-
-    if (!pilotHandled) {
+    // HDFS-17385 Phase II pilot: FGL_IIP PATH_WRITE + nested BM write.
+    PilotResult<Boolean> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> setReplicationPilot(src, replication, pc),
+        operationName, src);
+    if (pr.handled) {
+      success = pr.value;
+    } else {
       try {
         writeLock(RwLockMode.GLOBAL);
         try {
@@ -2843,7 +2775,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
    */
   private Boolean setReplicationPilot(String src, short replication,
-      FSPermissionChecker pc) throws IOException {
+      FSPermissionChecker pc) throws IOException, InterruptedException {
     // bm.verifyReplication is called by the legacy path too; keep
     // it outside the lock acquisition (legacy does the same — it's
     // called before fsd.writeLock in FSDirAttrOp.setReplication).
@@ -2853,22 +2785,25 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
       checkOperation(OperationCategory.WRITE);
       checkNameNodeSafeMode("Cannot set replication for " + src);
-
       INodesInPath iip = lip.iip();
       INode target = iip.getLastINode();
       if (target == null) {
-        return null;  // fall back so legacy raises the right error
+        throw new PilotEnvelopeMissException(
+            "setReplication: target does not exist " + src);
       }
       if (!target.isFile()) {
-        return null;  // directory/symlink — legacy returns false
+        throw new PilotEnvelopeMissException(
+            "setReplication: target is not a regular file " + src);
       }
       if (target.asFile().isStriped()) {
-        return null;  // striped files out of pilot scope
+        throw new PilotEnvelopeMissException(
+            "setReplication: striped file out of pilot scope " + src);
       }
       if (!ancestorsAllowMutate(iip)) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "setReplication: ancestor has snapshot/quota/storage-policy "
+                + src);
       }
-
       // BM write lock acquired UNDER PATH_WRITE; released BEFORE
       // PATH_WRITE closes. Satisfies assertions in BlockManager
       // .setReplication path (hasWriteLock(BM)) and processExtra-
@@ -2880,10 +2815,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       } finally {
         writeUnlock(RwLockMode.BM, "setReplication");
       }
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "setReplication interrupted on " + src);
     }
   }
 
@@ -3185,34 +3116,20 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
 
-    // HDFS-17385 Phase II pilot: try the FGL_IIP path first when
-    // the cluster is running IIPBasedFSNamesystemLock and the call
-    // matches the scoped envelope (no overwrite, no explicit EC/
-    // storage policy, no encryption provider, etc). On any envelope
-    // miss, fall through to the legacy writeLock(FS) path below.
+    // HDFS-17385 Phase II pilot: FGL_IIP PARENT_WRITE path.
     //
-    // Dispatch-shape note (intentional asymmetry vs the other 8
-    // pilot RPCs): this block uses an early `return stat` on success
-    // instead of a `pilotHandled` boolean, and it does NOT catch
-    // AccessControlException here. ACE audit logging is handled by
-    // the outer `startFile` wrapper (not this `startFileInt`
-    // method) via its own try/catch around this entire method.
-    // Other pilot RPCs inline both the operation and its audit
-    // wrapper in the same method, so they catch ACE directly.
-    // When the RPC-10 gate introduces a shared dispatch template,
-    // this asymmetry must be preserved: replicating the template's
-    // ACE-catch here would double-log audit failures via the outer
-    // wrapper.
-    if (canUsePilotStartFile(src, flag, ecPolicyName, storagePolicy)) {
-      try {
-        stat = startFilePilot(src, permissions, holder, clientMachine,
-            flag, createParent, replication, blockSize, pc, logRetryCache);
-        if (stat != null) {
-          return stat;
-        }
-      } catch (PilotEnvelopeMissException pem) {
-        // Envelope miss — fall through to legacy path.
-      }
+    // Dispatch-shape note: auditOnAce=false here because the outer
+    // startFile wrapper owns ACE audit logging; passing true would
+    // double-log on a rejected create. Every other pilot RPC inlines
+    // the ACE audit itself and uses the default-case tryPilot
+    // overload (auditOnAce=true).
+    PilotResult<HdfsFileStatus> pr = tryPilot(
+        () -> canUsePilotStartFile(src, flag, ecPolicyName, storagePolicy),
+        () -> startFilePilot(src, permissions, holder, clientMachine,
+            flag, createParent, replication, blockSize, pc, logRetryCache),
+        "create", src, /* auditOnAce */ false);
+    if (pr.handled && pr.value != null) {
+      return pr.value;
     }
 
     writeLock(RwLockMode.FS);
@@ -3334,35 +3251,32 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       PermissionStatus permissions, String holder, String clientMachine,
       EnumSet<CreateFlag> flag, boolean createParent, short replication,
       long blockSize, FSPermissionChecker pc, boolean logRetryCache)
-      throws IOException {
-    IIPBasedFSNamesystemLock iipLock =
-        (IIPBasedFSNamesystemLock) fsLock;
+      throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
     boolean skipSync = true;
     HdfsFileStatus stat = null;
     BlocksMapUpdateInfo toRemoveBlocks = null;
 
-    try (LockedIIP lip =
-        iipLock.lockPath(src,
-            IIPAcquireMode.PARENT_WRITE)) {
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PARENT_WRITE)) {
       checkOperation(OperationCategory.WRITE);
       checkNameNodeSafeMode("Cannot create file" + src);
 
       INodesInPath iip = lip.iip();
 
-      // Phase B envelope checks under held PARENT_WRITE. Any failure
-      // here causes the method to return null, signaling the caller
-      // to fall through to the legacy path.
+      // Phase B envelope checks under held PARENT_WRITE.
       INode parent = iip.length() >= 2 ? iip.getINode(-2) : null;
       if (parent == null || !parent.isDirectory()) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "startFile: parent missing or not a directory " + src);
       }
       if (!ancestorsAllowCreate(iip)) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "startFile: ancestor has quota or non-default storage policy "
+                + src);
       }
-
-      // Target must be absent (pilot doesn't handle existing target).
       if (iip.getLastINode() != null) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "startFile: target already exists " + src);
       }
 
       // Permission checks: traversal (execute) on every ancestor PLUS
@@ -3379,8 +3293,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       // bypass.
       dir.checkTraverse(pc, iip, DirOp.CREATE);
       if (dir.isPermissionEnabled()) {
-        dir.checkAncestorAccess(pc, iip,
-            FsAction.WRITE);
+        dir.checkAncestorAccess(pc, iip, FsAction.WRITE);
       }
 
       // Verify parent directory unless createParent is set (mirrors
@@ -3418,10 +3331,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       } finally {
         dir.writeUnlock();
       }
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "startFile interrupted on " + src);
     } finally {
       if (!skipSync) {
         getEditLog().logSync();
@@ -3978,28 +3887,19 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     FSPermissionChecker.setOperationType(operationName);
     boolean ret = false;
 
-    // HDFS-17385 Phase II pilot: try the FGL_IIP PARENT_WRITE path
-    // first for single-file deletes (pilot scope). Any envelope miss
-    // falls through to the legacy writeLock(GLOBAL) path.
-    boolean pilotHandled = false;
-    if (canUsePilotDelete(src)) {
-      try {
-        BlocksMapUpdateInfo[] holder = new BlocksMapUpdateInfo[1];
-        Boolean pilotRet = deletePilot(src, logRetryCache, holder, pc);
-        if (pilotRet != null) {
-          ret = pilotRet;
-          toRemovedBlocks = holder[0];
-          pilotHandled = true;
-        }
-      } catch (PilotEnvelopeMissException pem) {
-        // Fall through to legacy.
-      } catch (AccessControlException e) {
-        logAuditEvent(false, operationName, src);
-        throw e;
-      }
-    }
-
-    if (!pilotHandled) {
+    // HDFS-17385 Phase II pilot: FGL_IIP PARENT_WRITE path for
+    // single-file deletes. Uses a side-channel `holder` for the
+    // BlocksMapUpdateInfo because deletePilot returns Boolean and
+    // the out-of-band blocks map is assigned only on success.
+    final BlocksMapUpdateInfo[] holder = new BlocksMapUpdateInfo[1];
+    PilotResult<Boolean> pr = tryPilot(
+        () -> canUsePilotDelete(src),
+        () -> deletePilot(src, logRetryCache, holder, pc),
+        operationName, src);
+    if (pr.handled) {
+      ret = pr.value;
+      toRemovedBlocks = holder[0];
+    } else {
       try {
         writeLock(RwLockMode.GLOBAL);
         try {
@@ -4060,7 +3960,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    */
   private Boolean deletePilot(String src, boolean logRetryCache,
       BlocksMapUpdateInfo[] holder, FSPermissionChecker pc)
-      throws IOException {
+      throws IOException, InterruptedException {
     IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
     try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PARENT_WRITE)) {
       checkOperation(OperationCategory.WRITE);
@@ -4071,26 +3971,31 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       // Phase B envelope — parent + ancestor structural checks.
       INode parent = iip.length() >= 2 ? iip.getINode(-2) : null;
       if (parent == null || !parent.isDirectory()) {
-        return null;  // legacy will produce the right FNE/PNDE
+        throw new PilotEnvelopeMissException(
+            "delete: parent missing or not a directory " + src);
       }
       if (!ancestorsAllowMutate(iip)) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "delete: ancestor has snapshot/quota/storage-policy " + src);
       }
 
       // Target must exist and be a regular file. Directories,
       // symlinks, and already-snapshotted files fall back to legacy.
       INode target = iip.getLastINode();
       if (target == null) {
-        // Legacy FSDirDeleteOp.delete with missing target: deleteAllowed
-        // returns false → deleteInternal returns null → delete returns
-        // false. Replicate that directly without falling back.
+        // Legacy FSDirDeleteOp.delete with missing target:
+        // deleteAllowed returns false → deleteInternal returns null →
+        // delete returns false. Pilot handles this directly (no
+        // fall-back needed; legitimate Boolean.FALSE).
         return Boolean.FALSE;
       }
       if (!target.isFile()) {
-        return null;  // dir / symlink / reference — out of pilot scope
+        throw new PilotEnvelopeMissException(
+            "delete: target is not a regular file " + src);
       }
       if (target.asFile().isWithSnapshot()) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "delete: target is in a snapshot " + src);
       }
 
       // Permission check mirrors legacy FSDirDeleteOp.delete:
@@ -4103,9 +4008,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
 
       holder[0] = FSDirDeleteOp.deleteInternal(this, iip, logRetryCache);
       return holder[0] != null;
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException("delete interrupted on " + src);
     }
   }
 
@@ -4171,25 +4073,17 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
 
-    // HDFS-17385 Phase II pilot: try the FGL_IIP path first when
-    // the cluster is running IIPBasedFSNamesystemLock and the path
-    // doesn't hit envelope-miss conditions. Fall through to the
-    // legacy FS read-lock path on any miss.
-    boolean pilotHandled = false;
-    if (canUsePilotPathRead(src)) {
-      try {
-        stat = getFileInfoPilot(src, resolveLink, needLocation, needBlockToken,
-            pc);
-        pilotHandled = true;
-      } catch (PilotEnvelopeMissException pem) {
-        // Fall through to legacy.
-      } catch (AccessControlException e) {
-        logAuditEvent(false, operationName, src);
-        throw e;
-      }
-    }
-
-    if (!pilotHandled) {
+    // HDFS-17385 Phase II pilot: FGL_IIP PATH_READ path. Note:
+    // {@code null} is a legitimate result (file not found) — handled
+    // by tryPilot returning PilotResult.handled(null).
+    PilotResult<HdfsFileStatus> pr = tryPilot(
+        () -> canUsePilotPathRead(src),
+        () -> getFileInfoPilot(src, resolveLink, needLocation,
+            needBlockToken, pc),
+        operationName, src);
+    if (pr.handled) {
+      stat = pr.value;
+    } else {
       try {
         readLock(RwLockMode.FS);
         try {
@@ -4224,12 +4118,9 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    */
   private HdfsFileStatus getFileInfoPilot(String src, boolean resolveLink,
       boolean needLocation, boolean needBlockToken, FSPermissionChecker pc)
-      throws IOException {
-    IIPBasedFSNamesystemLock iipLock =
-        (IIPBasedFSNamesystemLock) fsLock;
-    try (LockedIIP lip =
-        iipLock.lockPath(src,
-            IIPAcquireMode.PATH_READ)) {
+      throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_READ)) {
       checkOperation(OperationCategory.READ);
       DirOp dirOp = resolveLink ? DirOp.READ : DirOp.READ_LINK;
       // Permission traversal check under held locks. Mirrors the
@@ -4262,10 +4153,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       return FSDirStatAndListingOp.getFileInfo(
           dir, lip.iip(), needLocation, needBlockToken);
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "getFileInfo interrupted on " + src);
     }
   }
 
@@ -4279,21 +4166,14 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     FSPermissionChecker.setOperationType(operationName);
     boolean success = false;
 
-    // HDFS-17385 Phase II pilot: try FGL_IIP PATH_READ first.
-    boolean pilotHandled = false;
-    if (canUsePilotPathRead(src)) {
-      try {
-        success = isFileClosedPilot(src, pc);
-        pilotHandled = true;
-      } catch (PilotEnvelopeMissException pem) {
-        // Envelope miss — fall through to legacy path.
-      } catch (AccessControlException e) {
-        logAuditEvent(false, operationName, src);
-        throw e;
-      }
-    }
-
-    if (!pilotHandled) {
+    // HDFS-17385 Phase II pilot: FGL_IIP PATH_READ path.
+    PilotResult<Boolean> pr = tryPilot(
+        () -> canUsePilotPathRead(src),
+        () -> isFileClosedPilot(src, pc),
+        operationName, src);
+    if (pr.handled) {
+      success = pr.value;
+    } else {
       try {
         readLock(RwLockMode.FS);
         try {
@@ -4325,7 +4205,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
    */
   private boolean isFileClosedPilot(String src, FSPermissionChecker pc)
-      throws IOException {
+      throws IOException, InterruptedException {
     IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
     try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_READ)) {
       checkOperation(OperationCategory.READ);
@@ -4343,10 +4223,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
         throw new AccessControlException(pnde.getMessage());
       }
       return FSDirStatAndListingOp.isFileClosed(dir, lip.iip(), src);
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "isFileClosed interrupted on " + src);
     }
   }
 
@@ -4636,28 +4512,14 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
 
-    // HDFS-17385 Phase II pilot: try the FGL_IIP PARENT_WRITE path first
-    // when the cluster is running IIPBasedFSNamesystemLock and the call
-    // matches the scoped envelope (simple single-level create, no
-    // encryption zone on ancestors, no quota, default storage policy).
-    // On any envelope miss, fall through to the legacy writeLock(FS)
-    // path below.
-    boolean pilotHandled = false;
-    if (canUsePilotMkdirs(src)) {
-      try {
-        auditStat = mkdirsPilot(src, permissions, createParent, pc);
-        if (auditStat != null) {
-          pilotHandled = true;
-        }
-      } catch (PilotEnvelopeMissException pem) {
-        // Envelope miss — fall through to legacy path.
-      } catch (AccessControlException e) {
-        logAuditEvent(false, operationName, src);
-        throw e;
-      }
-    }
-
-    if (!pilotHandled) {
+    // HDFS-17385 Phase II pilot: FGL_IIP PARENT_WRITE path.
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotMkdirs(src),
+        () -> mkdirsPilot(src, permissions, createParent, pc),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
         writeLock(RwLockMode.FS);
         try {
@@ -4709,29 +4571,29 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.10, §3.1
    */
   private FileStatus mkdirsPilot(String src, PermissionStatus permissions,
-      boolean createParent, FSPermissionChecker pc) throws IOException {
-    IIPBasedFSNamesystemLock iipLock =
-        (IIPBasedFSNamesystemLock) fsLock;
-    try (LockedIIP lip =
-        iipLock.lockPath(src,
-            IIPAcquireMode.PARENT_WRITE)) {
+      boolean createParent, FSPermissionChecker pc)
+      throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PARENT_WRITE)) {
       checkOperation(OperationCategory.WRITE);
       checkNameNodeSafeMode("Cannot create directory " + src);
 
       INodesInPath iip = lip.iip();
 
-      // Phase B envelope checks under held PARENT_WRITE. Any failure
-      // returns null to signal the caller to fall through to legacy.
+      // Phase B envelope checks under held PARENT_WRITE.
       INode parent = iip.length() >= 2 ? iip.getINode(-2) : null;
       if (parent == null || !parent.isDirectory()) {
         // Parent missing or not a directory — fall back so the legacy
         // path can either createParent or throw the appropriate
         // FileNotFoundException / ParentNotDirectoryException with the
         // full multi-level creation logic.
-        return null;
+        throw new PilotEnvelopeMissException(
+            "mkdirs: parent missing or not a directory " + src);
       }
       if (!ancestorsAllowCreate(iip)) {
-        return null;
+        throw new PilotEnvelopeMissException(
+            "mkdirs: ancestor has quota or non-default storage policy "
+                + src);
       }
 
       // Permission checks: traversal (execute) on every ancestor PLUS
@@ -4746,10 +4608,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       // (we fell back). With parent present, createParent=false is a
       // no-op distinction.
       return FSDirMkdirOp.mkdirsWithResolvedIIP(this, pc, iip, permissions);
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "mkdirs interrupted on " + src);
     }
   }
 
@@ -5409,23 +5267,17 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
 
-    // HDFS-17385 Phase II pilot: PATH_READ path. Fourth read-class
-    // pilot RPC; adds directory iteration / pagination concerns on
-    // top of the existing point-read RPCs.
-    boolean pilotHandled = false;
-    if (canUsePilotGetListing(src, startAfter)) {
-      try {
-        dl = getListingPilot(src, startAfter, needLocation, pc);
-        pilotHandled = true;
-      } catch (PilotEnvelopeMissException pem) {
-        // Envelope miss — fall through to legacy.
-      } catch (AccessControlException e) {
-        logAuditEvent(false, operationName, src);
-        throw e;
-      }
-    }
-
-    if (!pilotHandled) {
+    // HDFS-17385 Phase II pilot: FGL_IIP PATH_READ path. Note:
+    // {@code null} is a legitimate result (target not found,
+    // snapshot-dir empty) — handled by tryPilot returning
+    // PilotResult.handled(null).
+    PilotResult<DirectoryListing> pr = tryPilot(
+        () -> canUsePilotGetListing(src, startAfter),
+        () -> getListingPilot(src, startAfter, needLocation, pc),
+        operationName, src);
+    if (pr.handled) {
+      dl = pr.value;
+    } else {
       try {
         readLock(RwLockMode.FS);
         try {
@@ -5494,7 +5346,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
    */
   private DirectoryListing getListingPilot(String src, byte[] startAfter,
-      boolean needLocation, FSPermissionChecker pc) throws IOException {
+      boolean needLocation, FSPermissionChecker pc)
+      throws IOException, InterruptedException {
     IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
     try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_READ)) {
       checkOperation(OperationCategory.READ);
@@ -5510,10 +5363,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       return FSDirStatAndListingOp.getListingForPilot(
           dir, pc, lip.iip(), startAfter, needLocation);
-    } catch (InterruptedException ie) {
-      Thread.currentThread().interrupt();
-      throw new InterruptedIOException(
-          "getListing interrupted on " + src);
     }
   }
 
