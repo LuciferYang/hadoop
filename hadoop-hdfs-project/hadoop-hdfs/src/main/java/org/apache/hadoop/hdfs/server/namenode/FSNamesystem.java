@@ -2248,23 +2248,11 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
    */
   private boolean canUsePilotPathWrite(String src) {
-    if (!(fsLock instanceof IIPBasedFSNamesystemLock)) {
-      return false;
-    }
-    if (src == null || src.isEmpty()) {
+    if (!canUsePilotBase(src)) {
       return false;
     }
     // PATH_WRITE requires a non-root path (at least 2 components).
     if ("/".equals(src)) {
-      return false;
-    }
-    if (src.startsWith("/.reserved")) {
-      return false;
-    }
-    if (src.contains("/.snapshot")) {
-      return false;
-    }
-    if (provider != null) {
       return false;
     }
     return true;
@@ -3201,6 +3189,19 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     // matches the scoped envelope (no overwrite, no explicit EC/
     // storage policy, no encryption provider, etc). On any envelope
     // miss, fall through to the legacy writeLock(FS) path below.
+    //
+    // Dispatch-shape note (intentional asymmetry vs the other 8
+    // pilot RPCs): this block uses an early `return stat` on success
+    // instead of a `pilotHandled` boolean, and it does NOT catch
+    // AccessControlException here. ACE audit logging is handled by
+    // the outer `startFile` wrapper (not this `startFileInt`
+    // method) via its own try/catch around this entire method.
+    // Other pilot RPCs inline both the operation and its audit
+    // wrapper in the same method, so they catch ACE directly.
+    // When the RPC-10 gate introduces a shared dispatch template,
+    // this asymmetry must be preserved: replicating the template's
+    // ACE-catch here would double-log audit failures via the outer
+    // wrapper.
     if (canUsePilotStartFile(src, flag, ecPolicyName, storagePolicy)) {
       try {
         stat = startFilePilot(src, permissions, holder, clientMachine,
@@ -3299,18 +3300,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    */
   private boolean canUsePilotStartFile(String src, EnumSet<CreateFlag> flag,
       String ecPolicyName, String storagePolicy) {
-    if (!(fsLock instanceof
-        IIPBasedFSNamesystemLock)) {
-      return false;
-    }
-    if (src == null || src.isEmpty()) {
-      return false;
-    }
-    // Reserved paths, snapshot paths — out of pilot.
-    if (src.startsWith("/.reserved")) {
-      return false;
-    }
-    if (src.contains("/.snapshot")) {
+    if (!canUsePilotParentWrite(src)) {
       return false;
     }
     // Overwrite is out of pilot (envelope rejects it explicitly).
@@ -3322,12 +3312,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       return false;
     }
     if (storagePolicy != null && !storagePolicy.isEmpty()) {
-      return false;
-    }
-    // If the NN has an encryption provider configured, ancestor paths
-    // may be under an encryption zone — envelope rejects the whole
-    // path-class conservatively. Post-pilot can narrow this.
-    if (provider != null) {
       return false;
     }
     return true;
@@ -4049,26 +4033,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
    */
   private boolean canUsePilotDelete(String src) {
-    if (!(fsLock instanceof IIPBasedFSNamesystemLock)) {
-      return false;
-    }
-    if (src == null || src.isEmpty()) {
-      return false;
-    }
-    if ("/".equals(src)) {
-      // Deleting root is never allowed; let legacy return false.
-      return false;
-    }
-    if (src.startsWith("/.reserved")) {
-      return false;
-    }
-    if (src.contains("/.snapshot")) {
-      return false;
-    }
-    if (provider != null) {
-      return false;
-    }
-    return true;
+    return canUsePilotParentWrite(src);
   }
 
   /**
@@ -4394,6 +4359,44 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
    */
   private boolean canUsePilotPathRead(String src) {
+    return canUsePilotBase(src);
+  }
+
+  /**
+   * Shared Phase-A envelope check for pilot RPCs that take
+   * {@code PARENT_WRITE} (create, mkdirs, delete). Extends the base
+   * {@link #canUsePilotBase} check with the PARENT_WRITE-mode
+   * precondition that the path has at least 2 components (the mode
+   * cannot be acquired on the root INode).
+   *
+   * <p>Per-RPC specialisations (overwrite, EC policy, storage policy,
+   * etc.) happen in the caller's own {@code canUsePilotXxx} wrapper.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
+   */
+  private boolean canUsePilotParentWrite(String src) {
+    if (!canUsePilotBase(src)) {
+      return false;
+    }
+    // PARENT_WRITE requires a non-root path.
+    if ("/".equals(src)) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * The common base for every {@code canUsePilotXxx} helper. Rejects
+   * inputs that no pilot mode can handle regardless of lock flavour:
+   * a non-FGL_IIP cluster, empty/null paths, {@code /.reserved} or
+   * {@code /.snapshot} paths, and clusters with an encryption
+   * provider configured (ancestors may be in an encryption zone).
+   *
+   * <p>Per-mode and per-RPC specialisations layer on top of this.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
+   */
+  private boolean canUsePilotBase(String src) {
     if (!(fsLock instanceof IIPBasedFSNamesystemLock)) {
       return false;
     }
@@ -4406,6 +4409,9 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     if (src.contains("/.snapshot")) {
       return false;
     }
+    // If the NN has an encryption provider configured, ancestors
+    // may be under an encryption zone — envelope rejects the whole
+    // path-class conservatively. Post-pilot can narrow this.
     if (provider != null) {
       return false;
     }
@@ -4423,6 +4429,15 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * <p>Returns {@code false} signals the caller to fall through to
    * the legacy path (which handles quota / storage policy correctly).
    *
+   * <p><b>Not a copy-paste target for mutate-class RPCs.</b> If you
+   * are adding a new RPC that modifies an existing INode (setXxx,
+   * delete, etc.), use {@link #ancestorsAllowMutate} instead — it
+   * additionally rejects snapshot-bearing ancestors, which matters
+   * for {@code recordModification} bookkeeping. The two helpers
+   * look alike on purpose; the single-line difference is
+   * load-bearing.
+   *
+   * @see #ancestorsAllowMutate for the mutate-class variant
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
    */
   private boolean ancestorsAllowCreate(INodesInPath iip) {
@@ -4455,6 +4470,14 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * snapshot-bearing ancestor participate in snapshot bookkeeping
    * that the pilot's narrow lock does not cover.
    *
+   * <p><b>Not a copy-paste target for create-class RPCs.</b> If you
+   * are adding a new RPC that creates a new INode (startFile,
+   * mkdirs, etc.), use {@link #ancestorsAllowCreate} — the newly
+   * created INode is not in any snapshot, so the snapshot check
+   * here is unnecessarily strict. The two helpers look alike on
+   * purpose; the single-line difference is load-bearing.
+   *
+   * @see #ancestorsAllowCreate for the create-class variant
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
    */
   private boolean ancestorsAllowMutate(INodesInPath iip) {
@@ -4543,30 +4566,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
    */
   private boolean canUsePilotMkdirs(String src) {
-    if (!(fsLock instanceof
-        IIPBasedFSNamesystemLock)) {
-      return false;
-    }
-    if (src == null || src.isEmpty()) {
-      return false;
-    }
-    if (src.startsWith("/.reserved")) {
-      return false;
-    }
-    if (src.contains("/.snapshot")) {
-      return false;
-    }
-    // PARENT_WRITE requires a non-root path (at least 2 components).
-    if ("/".equals(src)) {
-      return false;
-    }
-    // If the NN has an encryption provider configured, ancestors may be
-    // under an encryption zone — envelope rejects the whole path-class
-    // conservatively. Post-pilot can narrow this.
-    if (provider != null) {
-      return false;
-    }
-    return true;
+    return canUsePilotParentWrite(src);
   }
 
   /**

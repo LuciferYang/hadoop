@@ -1,6 +1,10 @@
 # FGL_IIP RPC Migration Checklist
 
-Every RPC migration to `FGL_IIP` mode must follow this checklist. Reviewers reject PRs that do not satisfy every item. See [HDFS-17385-wave4-pilot-design.md](HDFS-17385-wave4-pilot-design.md) for the full design rationale.
+Every RPC migration to `FGL_IIP` mode must follow this checklist. Reviewers reject PRs that do not satisfy every item.
+
+**Authoritative references:**
+- [HDFS-17385-wave4-pilot-design.md](HDFS-17385-wave4-pilot-design.md) — full design rationale, mode taxonomy (§1.4), lock-ordering rules (§1.8), RPC-10 gate scope (§6.3).
+- [pre-rpc-10-review.md](pre-rpc-10-review.md) — findings from the 9-migration cohort. Read before starting migration #10+, especially for the dispatch-template work deferred to the RPC-10 gate.
 
 ## Pre-work
 
