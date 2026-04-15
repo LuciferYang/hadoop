@@ -2857,23 +2857,80 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
     FileStatus auditStat = null;
-    try {
-      writeLock(RwLockMode.FS);
+
+    // HDFS-17385 Phase II pilot: RPC #10. First migration using the
+    // RPC-10 gate's dispatch template (see tryPilot / PilotResult).
+    // FGL_IIP PATH_WRITE path.
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> setStoragePolicyPilot(src, policyName, pc),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot set storage policy for " + src);
-        auditStat = FSDirAttrOp.setStoragePolicy(dir, pc, blockManager, src,
-            policyName);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot set storage policy for " + src);
+          auditStat = FSDirAttrOp.setStoragePolicy(dir, pc, blockManager, src,
+              policyName);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
+  }
+
+  /**
+   * FGL_IIP path for {@code setStoragePolicy}. First RPC migrated
+   * using the RPC-10 gate's dispatch template — the pilot method is
+   * slimmer than earlier migrations because the template handles
+   * InterruptedException wrapping and PilotEnvelopeMissException
+   * propagation. Phase-B uses the shared {@link #ancestorsAllowMutate}
+   * helper; target must exist and be non-null.
+   *
+   * <p>The policy-name validation (via {@code bm.getStoragePolicy})
+   * is done OUTSIDE the pilot lock acquire — it's a pure lookup that
+   * throws {@link org.apache.hadoop.HadoopIllegalArgumentException}
+   * if the name is unknown. Matches the legacy shape.
+   *
+   * @throws PilotEnvelopeMissException on Phase-B envelope misses
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  private FileStatus setStoragePolicyPilot(String src, String policyName,
+      FSPermissionChecker pc) throws IOException, InterruptedException {
+    // Policy-name lookup first (legacy does this outside the writeLock).
+    final org.apache.hadoop.hdfs.protocol.BlockStoragePolicy policy =
+        blockManager.getStoragePolicy(policyName);
+    if (policy == null) {
+      throw new org.apache.hadoop.HadoopIllegalArgumentException(
+          "Cannot find a block policy with the name " + policyName);
+    }
+    final byte policyId = policy.getId();
+
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot set storage policy for " + src);
+      INodesInPath iip = lip.iip();
+      if (iip.getLastINode() == null) {
+        throw new PilotEnvelopeMissException(
+            "setStoragePolicy: target does not exist " + src);
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        throw new PilotEnvelopeMissException(
+            "setStoragePolicy: ancestor has snapshot/quota/storage-policy "
+                + src);
+      }
+      return FSDirAttrOp.setStoragePolicy(dir, pc, blockManager, iip, policyId);
+    }
   }
 
   /**

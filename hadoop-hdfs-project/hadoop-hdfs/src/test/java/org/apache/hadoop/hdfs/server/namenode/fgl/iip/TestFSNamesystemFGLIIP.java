@@ -2440,6 +2440,194 @@ public class TestFSNamesystemFGLIIP {
     assertNotNull(rootStatus);
     assertTrue(rootStatus.isDirectory());
   }
+
+  // ======================================================================
+  // setStoragePolicy pilot (RPC #10) — first RPC using the dispatch
+  // template introduced by the §6.3 RPC-10 gate refactor.
+  // ======================================================================
+
+  /** Happy path: set HOT policy on a file. */
+  @Test
+  @Timeout(60)
+  public void setStoragePolicyOnFile() throws Exception {
+    Path p = new Path("/sp10-file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096,
+        (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+    fs.setStoragePolicy(p,
+        HdfsConstants.HOT_STORAGE_POLICY_NAME);
+    // The getStoragePolicy client call reflects the change.
+    org.apache.hadoop.hdfs.protocol.BlockStoragePolicy policy =
+        fs.getClient().getStoragePolicy(p.toString());
+    assertEquals(HdfsConstants.HOT_STORAGE_POLICY_ID, policy.getId());
+  }
+
+  /** setStoragePolicy on a directory. */
+  @Test
+  @Timeout(60)
+  public void setStoragePolicyOnDirectory() throws Exception {
+    Path dir = new Path("/sp10-dir");
+    fs.mkdirs(dir);
+    fs.setStoragePolicy(dir, HdfsConstants.HOT_STORAGE_POLICY_NAME);
+    org.apache.hadoop.hdfs.protocol.BlockStoragePolicy policy =
+        fs.getClient().getStoragePolicy(dir.toString());
+    assertEquals(HdfsConstants.HOT_STORAGE_POLICY_ID, policy.getId());
+  }
+
+  /** Missing target → FileNotFoundException. */
+  @Test
+  @Timeout(60)
+  public void setStoragePolicyOnMissingTargetFails() throws Exception {
+    assertThrows(FileNotFoundException.class,
+        () -> fs.setStoragePolicy(new Path("/sp10-missing"),
+            HdfsConstants.HOT_STORAGE_POLICY_NAME));
+  }
+
+  /** Unknown policy → HadoopIllegalArgumentException. */
+  @Test
+  @Timeout(60)
+  public void setStoragePolicyWithUnknownPolicyFails() throws Exception {
+    Path p = new Path("/sp10-bad-policy");
+    try (FSDataOutputStream out = fs.create(p, true, 4096,
+        (short) 1, 4096L)) {
+      out.write(new byte[4]);
+    }
+    assertThrows(IOException.class,
+        () -> fs.setStoragePolicy(p, "NOT_A_REAL_POLICY_NAME"));
+  }
+
+  /** /.snapshot path falls back to legacy (which rejects it). */
+  @Test
+  @Timeout(60)
+  public void setStoragePolicySnapshotPathFallsBackToLegacy()
+      throws Exception {
+    Path dir = new Path("/sp10-snap-parent");
+    fs.mkdirs(dir);
+    fs.allowSnapshot(dir);
+    Path f = new Path(dir, "data");
+    try (FSDataOutputStream out = fs.create(f, true, 4096,
+        (short) 1, 4096L)) {
+      out.write(new byte[4]);
+    }
+    fs.createSnapshot(dir, "s1");
+    Path snapFile = new Path(dir, ".snapshot/s1/data");
+    assertThrows(IOException.class,
+        () -> fs.setStoragePolicy(snapFile,
+            HdfsConstants.HOT_STORAGE_POLICY_NAME));
+  }
+
+  /**
+   * Setting a storage policy on a file under a parent that has a
+   * namespace quota triggers the ancestorsAllowMutate fallback — the
+   * pilot declines, legacy handles it correctly.
+   */
+  @Test
+  @Timeout(60)
+  public void setStoragePolicyUnderAncestorQuotaFallsBackToLegacy()
+      throws Exception {
+    Path quotaDir = new Path("/sp10-quota-parent");
+    fs.mkdirs(quotaDir);
+    fs.setQuota(quotaDir, 100L, HdfsConstants.QUOTA_DONT_SET);
+    Path p = new Path(quotaDir, "file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096,
+        (short) 1, 4096L)) {
+      out.write(new byte[4]);
+    }
+    fs.setStoragePolicy(p, HdfsConstants.HOT_STORAGE_POLICY_NAME);
+    org.apache.hadoop.hdfs.protocol.BlockStoragePolicy policy =
+        fs.getClient().getStoragePolicy(p.toString());
+    assertEquals(HdfsConstants.HOT_STORAGE_POLICY_ID, policy.getId());
+  }
+
+  /**
+   * Non-writer user is rejected by checkPathAccess(WRITE). Verifies
+   * the dispatch template's ACE audit wrapping is wired correctly.
+   */
+  @Test
+  @Timeout(60)
+  public void setStoragePolicyRespectsPathAccessWrite() throws Exception {
+    Path parent = new Path("/sp10-perm");
+    fs.mkdirs(parent);
+    Path p = new Path(parent, "file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096,
+        (short) 1, 4096L)) {
+      out.write(new byte[4]);
+    }
+    fs.setPermission(p, new FsPermission((short) 0644));
+
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser("sp10-other-user");
+    final URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    other.doAs((PrivilegedExceptionAction<Void>) () -> {
+      DistributedFileSystem otherFs = (DistributedFileSystem)
+          FileSystem.get(clusterUri, otherConf);
+      try {
+        assertThrows(AccessControlException.class,
+            () -> otherFs.setStoragePolicy(p,
+                HdfsConstants.HOT_STORAGE_POLICY_NAME));
+      } finally {
+        otherFs.close();
+      }
+      return null;
+    });
+  }
+
+  /** 16 threads × 10 setStoragePolicy on distinct files. */
+  @Test
+  @Timeout(120)
+  public void parallelSetStoragePolicyDisjointTargets() throws Exception {
+    final int numThreads = 16;
+    for (int t = 0; t < numThreads; t++) {
+      Path p = new Path("/sp10-parallel/f" + t);
+      fs.mkdirs(p.getParent());
+      try (FSDataOutputStream out = fs.create(p, true, 4096,
+          (short) 1, 4096L)) {
+        out.write(new byte[4]);
+      }
+    }
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < 10; i++) {
+              fs.setStoragePolicy(
+                  new Path("/sp10-parallel/f" + tid),
+                  HdfsConstants.HOT_STORAGE_POLICY_NAME);
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
+    for (int t = 0; t < numThreads; t++) {
+      org.apache.hadoop.hdfs.protocol.BlockStoragePolicy policy =
+          fs.getClient().getStoragePolicy("/sp10-parallel/f" + t);
+      assertEquals(HdfsConstants.HOT_STORAGE_POLICY_ID, policy.getId());
+    }
+  }
 }
 
 

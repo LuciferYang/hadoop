@@ -325,6 +325,31 @@ public class FSDirAttrOp {
     return fsd.getAuditFileInfo(iip);
   }
 
+  /**
+   * FGL_IIP pilot overload of {@link #setStoragePolicy(FSDirectory,
+   * FSPermissionChecker, BlockManager, String, byte)}. Caller has
+   * already acquired {@code PATH_WRITE} on {@code iip} and verified
+   * the envelope. Skips {@code fsd.resolvePath}; everything else
+   * mirrors the legacy method.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  static FileStatus setStoragePolicy(FSDirectory fsd, FSPermissionChecker pc,
+      BlockManager bm, INodesInPath iip, final byte policyId)
+      throws IOException {
+    fsd.writeLock();
+    try {
+      if (fsd.isPermissionEnabled()) {
+        fsd.checkPathAccess(pc, iip, FsAction.WRITE);
+      }
+      unprotectedSetStoragePolicy(fsd, bm, iip, policyId);
+      fsd.getEditLog().logSetStoragePolicy(iip.getPath(), policyId);
+    } finally {
+      fsd.writeUnlock();
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
   static BlockStoragePolicy[] getStoragePolicies(BlockManager bm)
       throws IOException {
     return bm.getStoragePolicies();
