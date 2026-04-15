@@ -2996,22 +2996,61 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
     FileStatus auditStat = null;
-    try {
-      writeLock(RwLockMode.FS);
+
+    // HDFS-17385 Phase II pilot (post-gate): FGL_IIP PATH_WRITE path.
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> unsetStoragePolicyPilot(src, pc),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot unset storage policy for " + src);
-        auditStat = FSDirAttrOp.unsetStoragePolicy(dir, pc, blockManager, src);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot unset storage policy for " + src);
+          auditStat = FSDirAttrOp.unsetStoragePolicy(dir, pc, blockManager, src);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
+  }
+
+  /**
+   * FGL_IIP pilot for {@code unsetStoragePolicy}. Equivalent to
+   * setting the UNSPECIFIED policy id; delegates to the same pilot
+   * FSDirAttrOp.setStoragePolicy pre-resolved-IIP overload.
+   *
+   * @throws PilotEnvelopeMissException on Phase-B misses
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  private FileStatus unsetStoragePolicyPilot(String src,
+      FSPermissionChecker pc) throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot unset storage policy for " + src);
+      INodesInPath iip = lip.iip();
+      if (iip.getLastINode() == null) {
+        throw new PilotEnvelopeMissException(
+            "unsetStoragePolicy: target does not exist " + src);
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        throw new PilotEnvelopeMissException(
+            "unsetStoragePolicy: ancestor has snapshot/quota/storage-policy "
+                + src);
+      }
+      return FSDirAttrOp.setStoragePolicy(dir, pc, blockManager, iip,
+          HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED);
+    }
   }
   /**
    * Get the storage policy for a file or a directory.
@@ -9314,22 +9353,58 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+
+    // HDFS-17385 Phase II pilot (post-gate): FGL_IIP PATH_WRITE path.
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> setAclPilot(src, aclSpec, pc),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot set ACL on " + src);
-        auditStat = FSDirAclOp.setAcl(dir, pc, src, aclSpec);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot set ACL on " + src);
+          auditStat = FSDirAclOp.setAcl(dir, pc, src, aclSpec);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
+  }
+
+  /**
+   * FGL_IIP pilot for {@code setAcl}. PATH_WRITE on the target;
+   * permission requirement is owner (via {@code fsd.checkOwner}).
+   *
+   * @throws PilotEnvelopeMissException on Phase-B misses
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  private FileStatus setAclPilot(String src, List<AclEntry> aclSpec,
+      FSPermissionChecker pc) throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot set ACL on " + src);
+      INodesInPath iip = lip.iip();
+      if (iip.getLastINode() == null) {
+        throw new PilotEnvelopeMissException(
+            "setAcl: target does not exist " + src);
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        throw new PilotEnvelopeMissException(
+            "setAcl: ancestor has snapshot/quota/storage-policy " + src);
+      }
+      return FSDirAclOp.setAcl(dir, pc, iip, aclSpec);
+    }
   }
 
   AclStatus getAclStatus(String src) throws IOException {

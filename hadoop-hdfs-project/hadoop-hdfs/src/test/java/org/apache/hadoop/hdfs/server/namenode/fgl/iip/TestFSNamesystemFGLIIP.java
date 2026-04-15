@@ -2628,6 +2628,124 @@ public class TestFSNamesystemFGLIIP {
       assertEquals(HdfsConstants.HOT_STORAGE_POLICY_ID, policy.getId());
     }
   }
+
+  // ======================================================================
+  // unsetStoragePolicy pilot (RPC #11).
+  // ======================================================================
+
+  /** Happy path: set then unset. */
+  @Test
+  @Timeout(60)
+  public void unsetStoragePolicyOnFile() throws Exception {
+    Path p = new Path("/usp-file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096,
+        (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+    fs.setStoragePolicy(p, HdfsConstants.HOT_STORAGE_POLICY_NAME);
+    fs.unsetStoragePolicy(p);
+    org.apache.hadoop.hdfs.protocol.BlockStoragePolicy policy =
+        fs.getClient().getStoragePolicy(p.toString());
+    // Unset → default policy (typically HOT per suite default).
+    assertNotNull(policy);
+  }
+
+  /** Missing target → FileNotFoundException. */
+  @Test
+  @Timeout(60)
+  public void unsetStoragePolicyOnMissingTargetFails() throws Exception {
+    assertThrows(FileNotFoundException.class,
+        () -> fs.unsetStoragePolicy(new Path("/usp-missing")));
+  }
+
+  // ======================================================================
+  // setAcl pilot (RPC #12).
+  // ======================================================================
+
+  /** Happy path: set a simple ACL on a file. */
+  @Test
+  @Timeout(60)
+  public void setAclOnFile() throws Exception {
+    Path p = new Path("/acl-file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096,
+        (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+    java.util.List<org.apache.hadoop.fs.permission.AclEntry> acl =
+        org.apache.hadoop.fs.permission.AclEntry.parseAclSpec(
+            "user::rwx,group::r--,other::r--,user:foo:rwx",
+            true);
+    fs.setAcl(p, acl);
+    // Reading back via getAclStatus confirms the entries were applied.
+    org.apache.hadoop.fs.permission.AclStatus status = fs.getAclStatus(p);
+    assertTrue(status.getEntries().stream()
+        .anyMatch(e -> "foo".equals(e.getName())),
+        "named user 'foo' must be present in ACL entries");
+  }
+
+  /** setAcl on a directory. */
+  @Test
+  @Timeout(60)
+  public void setAclOnDirectory() throws Exception {
+    Path dir = new Path("/acl-dir");
+    fs.mkdirs(dir);
+    java.util.List<org.apache.hadoop.fs.permission.AclEntry> acl =
+        org.apache.hadoop.fs.permission.AclEntry.parseAclSpec(
+            "user::rwx,group::r-x,other::---,user:bar:rwx,default:user::rwx,"
+                + "default:group::r-x,default:other::---,default:user:bar:rwx",
+            true);
+    fs.setAcl(dir, acl);
+    org.apache.hadoop.fs.permission.AclStatus status =
+        fs.getAclStatus(dir);
+    assertTrue(status.getEntries().stream()
+        .anyMatch(e -> "bar".equals(e.getName())));
+  }
+
+  /** Missing target → FileNotFoundException. */
+  @Test
+  @Timeout(60)
+  public void setAclOnMissingTargetFails() throws Exception {
+    java.util.List<org.apache.hadoop.fs.permission.AclEntry> acl =
+        org.apache.hadoop.fs.permission.AclEntry.parseAclSpec(
+            "user::rwx,group::r--,other::r--", true);
+    assertThrows(FileNotFoundException.class,
+        () -> fs.setAcl(new Path("/acl-missing"), acl));
+  }
+
+  /** Non-owner user cannot setAcl. */
+  @Test
+  @Timeout(60)
+  public void setAclRespectsOwnerCheck() throws Exception {
+    Path p = new Path("/acl-perm/file");
+    fs.mkdirs(p.getParent());
+    try (FSDataOutputStream out = fs.create(p, true, 4096,
+        (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser("acl-other-user");
+    final URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    final java.util.List<org.apache.hadoop.fs.permission.AclEntry> acl =
+        org.apache.hadoop.fs.permission.AclEntry.parseAclSpec(
+            "user::rwx,group::r--,other::r--,user:evil:rwx", true);
+
+    other.doAs((PrivilegedExceptionAction<Void>) () -> {
+      DistributedFileSystem otherFs = (DistributedFileSystem)
+          FileSystem.get(clusterUri, otherConf);
+      try {
+        assertThrows(AccessControlException.class,
+            () -> otherFs.setAcl(p, acl));
+      } finally {
+        otherFs.close();
+      }
+      return null;
+    });
+  }
 }
 
 

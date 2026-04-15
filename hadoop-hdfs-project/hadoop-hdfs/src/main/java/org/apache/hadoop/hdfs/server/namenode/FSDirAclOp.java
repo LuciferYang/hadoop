@@ -150,6 +150,31 @@ class FSDirAclOp {
     return fsd.getAuditFileInfo(iip);
   }
 
+  /**
+   * FGL_IIP pilot overload. Caller has already acquired
+   * {@code PATH_WRITE} on {@code iip}. Mirrors the legacy
+   * {@link #setAcl(FSDirectory, FSPermissionChecker, String, List)}
+   * shape without the {@code resolvePath} step.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  static FileStatus setAcl(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip,
+      List<AclEntry> aclSpec) throws IOException {
+    checkAclsConfigFlag(fsd);
+    fsd.writeLock();
+    try {
+      fsd.checkOwner(pc, iip);
+      List<AclEntry> newAcl = unprotectedSetAcl(fsd, iip, aclSpec, false);
+      fsd.getEditLog().logSetAcl(iip.getPath(), newAcl);
+    } catch (AclException e) {
+      throw new AclException(e.getMessage() + " Path: " + iip.getPath(), e);
+    } finally {
+      fsd.writeUnlock();
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
   static AclStatus getAclStatus(
       FSDirectory fsd, FSPermissionChecker pc, String src) throws IOException {
     checkAclsConfigFlag(fsd);
