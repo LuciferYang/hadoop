@@ -245,6 +245,13 @@ public final class INodeLockManager {
           "nested IIP acquisition is forbidden (depth="
               + HELD_IIP_DEPTH.get() + ")");
     }
+    // Lock-ordering rule 5 (design spec §1.8): compat-write must never
+    // be held when acquiring IIP locks. ADMIN_META is the only mode
+    // that takes compat-write and it bypasses this method entirely.
+    // Assert to catch any future caller that forgets.
+    assert !compatLock.isWriteLockedByCurrentThread()
+        : "compat-write held at IIP acquire — violates rule 5 "
+          + "(compat-write never held under IIP lock)";
 
     byte[][] components = INode.getPathComponents(path);
     if (components == null || components.length == 0) {

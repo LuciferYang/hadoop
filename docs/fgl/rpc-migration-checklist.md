@@ -12,12 +12,12 @@ Every RPC migration to `FGL_IIP` mode must follow this checklist. Reviewers reje
 ## Mode selection
 
 - [ ] Picked the appropriate `IIPAcquireMode`:
-  - Read-only, single file/dir → `SINGLE_INODE_READ`
-  - Write to single file/dir, no parent mutation → `SINGLE_INODE_WRITE`
-  - Create-child (create, mkdir) → `PARENT_WRITE`
-  - Subtree operation (delete -r, chown -R, setQuota on subtree) → `ANCESTOR_WRITE`
-  - Rename → `RENAME_WRITE`
-  - Admin/meta → `ADMIN_META`
+  - Read-only, single file/dir → `PATH_READ`
+  - Write to single file/dir, no parent mutation (setPermission, setOwner, setTimes, setReplication) → `PATH_WRITE`
+  - Create-child or single-child removal (create, mkdir, delete) → `PARENT_WRITE`
+  - Subtree operation (delete -r, chown -R, setQuota on subtree) → `ANCESTOR_WRITE` *(deferred)*
+  - Rename → `RENAME_WRITE` *(deferred)*
+  - Admin/meta → `ADMIN_META` *(fallback)*
 - [ ] If the RPC needs a `DEFERRED` mode, **STOP**. File a separate ticket to implement the mode in `INodeLockManager` first.
 - [ ] Did **not** add a new mode without updating the taxonomy table in the pilot design spec and re-running the pilot gate review.
 

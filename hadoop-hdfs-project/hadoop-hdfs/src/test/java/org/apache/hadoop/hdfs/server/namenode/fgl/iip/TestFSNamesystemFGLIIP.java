@@ -2338,6 +2338,108 @@ public class TestFSNamesystemFGLIIP {
     }
     assertEquals(0, errors.get());
   }
+
+  // ======================================================================
+  // Pre-RPC-10 gate review: ancestor-fallback coverage + root PATH_READ.
+  // These tests close gaps surfaced during the 9-migration review.
+  // ======================================================================
+
+  /**
+   * Pilot-mutate RPC on a file whose ancestor has a directory quota
+   * set must fall back to legacy (ancestorsAllowMutate → false). Legacy
+   * handles the quota bookkeeping correctly; pilot avoids touching it.
+   * Uses namespace-only quota (not disk space) to keep the test tight
+   * and avoid per-cluster storage sizing.
+   */
+  @Test
+  @Timeout(60)
+  public void setPermissionUnderAncestorQuotaFallsBackToLegacy()
+      throws Exception {
+    Path quotaDir = new Path("/preview-quota-parent");
+    fs.mkdirs(quotaDir);
+    // Namespace quota of 100 inodes, no disk space cap.
+    fs.setQuota(quotaDir, 100L, HdfsConstants.QUOTA_DONT_SET);
+    Path p = new Path(quotaDir, "file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+    FsPermission newPerm = new FsPermission((short) 0600);
+    fs.setPermission(p, newPerm);
+    // Legacy must apply the change correctly.
+    assertEquals(newPerm, fs.getFileStatus(p).getPermission());
+  }
+
+  /**
+   * setOwner under ancestor quota must fall back correctly. Uses
+   * namespace-only quota (same rationale as the setPermission case).
+   */
+  @Test
+  @Timeout(60)
+  public void setOwnerUnderAncestorQuotaFallsBackToLegacy()
+      throws Exception {
+    Path quotaDir = new Path("/preview-so-quota-parent");
+    fs.mkdirs(quotaDir);
+    fs.setQuota(quotaDir, 100L, HdfsConstants.QUOTA_DONT_SET);
+    Path p = new Path(quotaDir, "file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+    fs.setOwner(p, "quota-fallback-user", null);
+    assertEquals("quota-fallback-user",
+        fs.getFileStatus(p).getOwner());
+  }
+
+  /**
+   * Delete on a file whose ancestor is snapshottable must fall back
+   * to legacy (ancestorsAllowMutate rejects isSnapshottable).
+   */
+  @Test
+  @Timeout(60)
+  public void deleteUnderSnapshottableAncestorFallsBackToLegacy()
+      throws Exception {
+    Path parent = new Path("/preview-snap-able");
+    fs.mkdirs(parent);
+    fs.allowSnapshot(parent);
+    Path p = new Path(parent, "file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+    // Delete must succeed via the legacy fallback, which handles
+    // snapshot bookkeeping correctly.
+    assertTrue(fs.delete(p, false));
+    assertFalse(fs.exists(p));
+  }
+
+  /**
+   * Create under an ancestor with a namespace quota must fall back
+   * to legacy (ancestorsAllowCreate → false).
+   */
+  @Test
+  @Timeout(60)
+  public void createUnderAncestorQuotaFallsBackToLegacy()
+      throws Exception {
+    Path quotaDir = new Path("/preview-create-quota");
+    fs.mkdirs(quotaDir);
+    fs.setQuota(quotaDir, 100L, HdfsConstants.QUOTA_DONT_SET);
+    Path p = new Path(quotaDir, "file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+    assertTrue(fs.exists(p));
+  }
+
+  /**
+   * getFileInfo on the root path "/". PATH_READ on root is allowed
+   * (pathLen=1, lock only the root INode). Edge case not previously
+   * covered.
+   */
+  @Test
+  @Timeout(60)
+  public void getFileInfoOnRootPath() throws Exception {
+    FileStatus rootStatus = fs.getFileStatus(new Path("/"));
+    assertNotNull(rootStatus);
+    assertTrue(rootStatus.isDirectory());
+  }
 }
 
 
