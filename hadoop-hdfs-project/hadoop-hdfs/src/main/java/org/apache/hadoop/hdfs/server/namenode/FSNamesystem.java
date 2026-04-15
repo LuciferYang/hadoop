@@ -189,6 +189,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 import javax.annotation.Nonnull;
@@ -4383,6 +4384,127 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       return false;
     }
     return true;
+  }
+
+  /**
+   * Outcome of a pilot dispatch. {@link #handled} = {@code true}
+   * means the pilot ran and its (possibly null) {@link #value} is
+   * authoritative; the caller must NOT fall through to the legacy
+   * path. {@link #handled} = {@code false} means the pilot did not
+   * run (envelope rejected at Phase A, or {@link PilotEnvelopeMissException}
+   * at Phase B / walk time); the caller MUST run the legacy path.
+   *
+   * <p>Using a wrapper instead of a plain nullable R avoids the
+   * ambiguity between "pilot handled and returned null" (legitimate
+   * for some RPCs like {@code getFileInfo}) and "pilot decided not
+   * to handle this — fall back" (all other RPCs). The outer method
+   * always inspects {@code handled}; the raw {@code value} is
+   * consumed only when {@code handled} is true.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §6.3 RPC-10 gate
+   */
+  static final class PilotResult<R> {
+    private static final PilotResult<?> MISS =
+        new PilotResult<>(false, null);
+
+    final boolean handled;
+    final R value;
+
+    private PilotResult(boolean handled, R value) {
+      this.handled = handled;
+      this.value = value;
+    }
+
+    @SuppressWarnings("unchecked")
+    static <R> PilotResult<R> miss() {
+      return (PilotResult<R>) MISS;
+    }
+
+    static <R> PilotResult<R> handled(R value) {
+      return new PilotResult<>(true, value);
+    }
+  }
+
+  /**
+   * Operation run under a pilot lock. Callers provide this lambda
+   * to {@link #tryPilot}; it must throw
+   * {@link PilotEnvelopeMissException} on a Phase-B envelope miss
+   * (the template catches it and returns {@link PilotResult#miss}).
+   * {@link InterruptedException} thrown from inside the lambda is
+   * wrapped into {@link InterruptedIOException} by the template.
+   */
+  @FunctionalInterface
+  interface PilotOperation<R> {
+    R run() throws IOException, InterruptedException;
+  }
+
+  /**
+   * Pilot-dispatch template for FGL_IIP-migrated RPCs. Runs
+   * {@code pilotOp} if {@code canUsePilot.getAsBoolean()} returns
+   * {@code true}. Handles the boilerplate so every migrated RPC's
+   * outer method is ~3 lines of pilot dispatch instead of ~15.
+   *
+   * <p>Exception handling:
+   * <ul>
+   *   <li>{@link PilotEnvelopeMissException} → {@link PilotResult#miss}
+   *       (caller falls through to legacy).</li>
+   *   <li>{@link AccessControlException} → {@code logAuditEvent(false,
+   *       operationName, src)} + rethrow, when {@code auditOnAce} is
+   *       {@code true}. {@code startFileInt} passes {@code false}
+   *       because the outer {@code startFile} wrapper owns the audit
+   *       wrapping; double-audit would otherwise occur.</li>
+   *   <li>{@link InterruptedException} → wrap into
+   *       {@link InterruptedIOException} with {@code operationName}
+   *       and {@code src} in the message.</li>
+   * </ul>
+   *
+   * <p>This is the standard shape for all post-RPC-10-gate
+   * migrations. See {@code docs/fgl/rpc-migration-checklist.md}.
+   *
+   * @param canUsePilot Phase-A envelope check (usually
+   *                    {@code canUsePilotXxx(src, ...)}).
+   * @param pilotOp Pilot logic; must throw
+   *                {@link PilotEnvelopeMissException} on Phase-B miss.
+   * @param operationName Used in audit logs and the
+   *                      {@link InterruptedIOException} message.
+   * @param src Used in the {@link InterruptedIOException} message.
+   * @param auditOnAce Whether to log a negative audit event and
+   *                   rethrow on {@link AccessControlException}.
+   *                   Pass {@code true} unless the outer method
+   *                   wraps this call in its own ACE audit catch.
+   * @return {@link PilotResult#handled} on pilot success;
+   *         {@link PilotResult#miss} on envelope miss.
+   */
+  private <R> PilotResult<R> tryPilot(BooleanSupplier canUsePilot,
+      PilotOperation<R> pilotOp, String operationName, String src,
+      boolean auditOnAce) throws IOException {
+    if (!canUsePilot.getAsBoolean()) {
+      return PilotResult.miss();
+    }
+    try {
+      return PilotResult.handled(pilotOp.run());
+    } catch (PilotEnvelopeMissException pem) {
+      return PilotResult.miss();
+    } catch (AccessControlException e) {
+      if (auditOnAce) {
+        logAuditEvent(false, operationName, src);
+      }
+      throw e;
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException(
+          operationName + " interrupted on " + src);
+    }
+  }
+
+  /**
+   * Default-case overload: audits on {@link AccessControlException}.
+   * The common choice for every RPC except {@code startFileInt}.
+   */
+  private <R> PilotResult<R> tryPilot(BooleanSupplier canUsePilot,
+      PilotOperation<R> pilotOp, String operationName, String src)
+      throws IOException {
+    return tryPilot(canUsePilot, pilotOp, operationName, src, true);
   }
 
   /**
