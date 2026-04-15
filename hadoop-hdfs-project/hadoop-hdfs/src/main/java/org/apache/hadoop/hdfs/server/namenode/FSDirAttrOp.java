@@ -70,6 +70,36 @@ public class FSDirAttrOp {
     return fsd.getAuditFileInfo(iip);
   }
 
+  /**
+   * FGL_IIP pilot overload. The caller
+   * ({@code FSNamesystem.setPermissionPilot}) has already acquired
+   * {@code PATH_WRITE} on the target via
+   * {@link org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock}
+   * and has verified the envelope, so this overload accepts a
+   * pre-resolved {@link INodesInPath} and skips {@code resolvePath}.
+   * The {@code fsd.writeLock()} here satisfies the
+   * {@code unprotectedSetPermission} assertion and matches the legacy
+   * shape.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  static FileStatus setPermission(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip,
+      FsPermission permission) throws IOException {
+    boolean changed;
+    fsd.writeLock();
+    try {
+      fsd.checkOwner(pc, iip);
+      changed = unprotectedSetPermission(fsd, iip, permission);
+    } finally {
+      fsd.writeUnlock();
+    }
+    if (changed) {
+      fsd.getEditLog().logSetPermissions(iip.getPath(), permission);
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
   static FileStatus setOwner(
       FSDirectory fsd, FSPermissionChecker pc, String src, String username,
       String group) throws IOException {

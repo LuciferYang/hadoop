@@ -1392,4 +1392,263 @@ public class TestFSNamesystemFGLIIP {
     // No descendants should remain.
     assertEquals(0, fs.listStatus(hot).length);
   }
+
+  // ======================================================================
+  // setPermission pilot path (PATH_WRITE).
+  // First migration exercising the PATH_WRITE mode.
+  // ======================================================================
+
+  /** Set permission on a regular file under a shallow path. */
+  @Test
+  @Timeout(60)
+  public void setPermissionOnShallowFile() throws Exception {
+    Path p = new Path("/sp-shallow");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    FsPermission newPerm = new FsPermission((short) 0640);
+    fs.setPermission(p, newPerm);
+    assertEquals(newPerm, fs.getFileStatus(p).getPermission());
+  }
+
+  /** Set permission on a regular file under a nested path. */
+  @Test
+  @Timeout(60)
+  public void setPermissionOnDeepFile() throws Exception {
+    Path parent = new Path("/sp-deep/a/b");
+    fs.mkdirs(parent);
+    Path p = new Path(parent, "file");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    FsPermission newPerm = new FsPermission((short) 0600);
+    fs.setPermission(p, newPerm);
+    assertEquals(newPerm, fs.getFileStatus(p).getPermission());
+  }
+
+  /** Set permission on a directory target (not just files). */
+  @Test
+  @Timeout(60)
+  public void setPermissionOnDirectory() throws Exception {
+    Path dir = new Path("/sp-dir");
+    fs.mkdirs(dir);
+    FsPermission newPerm = new FsPermission((short) 0750);
+    fs.setPermission(dir, newPerm);
+    assertEquals(newPerm, fs.getFileStatus(dir).getPermission());
+  }
+
+  /** Missing target: legacy throws FileNotFoundException. */
+  @Test
+  @Timeout(60)
+  public void setPermissionOnMissingTargetFails() throws Exception {
+    assertThrows(FileNotFoundException.class, () ->
+        fs.setPermission(new Path("/sp-missing"),
+            new FsPermission((short) 0755)));
+  }
+
+  /** /.snapshot paths fall back to legacy which rejects them. */
+  @Test
+  @Timeout(60)
+  public void setPermissionSnapshotPathFallsBackToLegacy() throws Exception {
+    Path dir = new Path("/sp-snap-parent");
+    fs.mkdirs(dir);
+    fs.allowSnapshot(dir);
+    Path f = new Path(dir, "data");
+    try (FSDataOutputStream out = fs.create(f)) {
+      out.write(new byte[8]);
+    }
+    fs.createSnapshot(dir, "s1");
+    Path snapFile = new Path(dir, ".snapshot/s1/data");
+    // Changing permissions through a snapshot path is forbidden in
+    // HDFS; legacy throws SnapshotAccessControlException.
+    assertThrows(IOException.class,
+        () -> fs.setPermission(snapFile, new FsPermission((short) 0700)));
+  }
+
+  /** /.reserved paths fall back to legacy. */
+  @Test
+  @Timeout(60)
+  public void setPermissionReservedPathFallsBackToLegacy() throws Exception {
+    Path p = new Path("/sp-reserved");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    long fileId = fs.getClient().getFileInfo(p.toString()).getFileId();
+    String reserved = "/.reserved/.inodes/" + fileId;
+    // Legacy accepts /.reserved/.inodes/<id> — the operation still
+    // takes effect on the real INode. Pilot envelope rejects
+    // /.reserved so the call goes through the legacy path.
+    FsPermission newPerm = new FsPermission((short) 0600);
+    fs.setPermission(new Path(reserved), newPerm);
+    assertEquals(newPerm, fs.getFileStatus(p).getPermission());
+  }
+
+  /**
+   * Non-owner (and non-superuser) cannot setPermission. Pilot must
+   * enforce checkOwner.
+   */
+  @Test
+  @Timeout(60)
+  public void setPermissionRespectsOwnerCheck() throws Exception {
+    Path p = new Path("/sp-perm/file");
+    fs.mkdirs(p.getParent());
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser("sp-other-user");
+    final URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    other.doAs((PrivilegedExceptionAction<Void>) () -> {
+      DistributedFileSystem otherFs = (DistributedFileSystem)
+          FileSystem.get(clusterUri, otherConf);
+      try {
+        assertThrows(AccessControlException.class,
+            () -> otherFs.setPermission(p, new FsPermission((short) 0777)));
+      } finally {
+        otherFs.close();
+      }
+      return null;
+    });
+    // Owner can still change.
+    fs.setPermission(p, new FsPermission((short) 0600));
+    assertEquals(new FsPermission((short) 0600),
+        fs.getFileStatus(p).getPermission());
+  }
+
+  /**
+   * Disjoint-targets concurrency: 16 threads setPermission on their
+   * own distinct files. Under PATH_WRITE, each call takes write lock
+   * only on its own target; concurrent calls do not serialise.
+   */
+  @Test
+  @Timeout(120)
+  public void parallelSetPermissionDisjointTargets() throws Exception {
+    final int numThreads = 16;
+    final int iterationsPerThread = 20;
+    for (int t = 0; t < numThreads; t++) {
+      Path p = new Path("/sp-parallel/f" + t);
+      fs.mkdirs(p.getParent());
+      try (FSDataOutputStream out = fs.create(p)) {
+        out.write(new byte[4]);
+      }
+    }
+
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < iterationsPerThread; i++) {
+              // Flip between two permission sets — each call must
+              // succeed and leave a deterministic final state.
+              short mode = (i % 2 == 0) ? (short) 0640 : (short) 0600;
+              fs.setPermission(new Path("/sp-parallel/f" + tid),
+                  new FsPermission(mode));
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
+    // After (iterationsPerThread=20) flips ending on an even iteration
+    // index, final permission per file should be 0600 (the odd-index
+    // side of the flip). Verify all files ended deterministically.
+    FsPermission expected = new FsPermission((short) 0600);
+    for (int t = 0; t < numThreads; t++) {
+      assertEquals(expected,
+          fs.getFileStatus(new Path("/sp-parallel/f" + t)).getPermission(),
+          "unexpected final permission for file " + t);
+    }
+  }
+
+  /**
+   * Concurrent readers (getFileInfo via PATH_READ) against a writer
+   * (setPermission via PATH_WRITE) on the SAME file. Readers take
+   * per-INode READ lock on the target; writer takes WRITE. They
+   * conflict on the target INode's lock, so this test verifies no
+   * deadlock and eventual consistency.
+   */
+  @Test
+  @Timeout(120)
+  public void concurrentReadersVsSetPermissionOnSameFile() throws Exception {
+    Path p = new Path("/sp-rw-hot");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[32]);
+    }
+
+    final int readers = 12;
+    final int writerIterations = 40;
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+    final java.util.concurrent.atomic.AtomicBoolean done =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    ExecutorService exec = Executors.newFixedThreadPool(readers + 1);
+    try {
+      Future<?>[] futures = new Future<?>[readers + 1];
+      for (int t = 0; t < readers; t++) {
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            while (!done.get()) {
+              FileStatus s = fs.getFileStatus(p);
+              if (s == null || s.getPath() == null) {
+                errors.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      futures[readers] = exec.submit(() -> {
+        try {
+          start.await();
+          for (int i = 0; i < writerIterations; i++) {
+            short mode = (i % 2 == 0) ? (short) 0640 : (short) 0600;
+            fs.setPermission(p, new FsPermission(mode));
+          }
+        } catch (Exception e) {
+          errors.incrementAndGet();
+          throw new RuntimeException(e);
+        } finally {
+          done.set(true);
+        }
+        return null;
+      });
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
+  }
 }
+

@@ -2197,22 +2197,138 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+
+    // HDFS-17385 Phase II pilot: first PATH_WRITE migration. Pilot
+    // envelope handles the non-reserved / non-snapshot / simple-subtree
+    // case; anything else falls through to the legacy writeLock(FS)
+    // path below.
+    boolean pilotHandled = false;
+    if (canUsePilotPathWrite(src)) {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot set permission for " + src);
-        auditStat = FSDirAttrOp.setPermission(dir, pc, src, permission);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        auditStat = setPermissionPilot(src, permission, pc);
+        if (auditStat != null) {
+          pilotHandled = true;
+        }
+      } catch (PilotEnvelopeMissException pem) {
+        // Envelope miss — fall through to legacy path.
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
+    }
+
+    if (!pilotHandled) {
+      try {
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot set permission for " + src);
+          auditStat = FSDirAttrOp.setPermission(dir, pc, src, permission);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
+      }
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
+  }
+
+  /**
+   * Shared Phase-A envelope check for pilot RPCs that take
+   * {@code PATH_WRITE} on an existing single target (setPermission,
+   * setOwner, setTimes, setReplication). Extracted now rather than
+   * at the §6.3 RPC-10 gate because the four upcoming single-target
+   * write RPCs all repeat the same checks; delaying extraction would
+   * create four copies.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
+   */
+  private boolean canUsePilotPathWrite(String src) {
+    if (!(fsLock instanceof IIPBasedFSNamesystemLock)) {
+      return false;
+    }
+    if (src == null || src.isEmpty()) {
+      return false;
+    }
+    // PATH_WRITE requires a non-root path (at least 2 components).
+    if ("/".equals(src)) {
+      return false;
+    }
+    if (src.startsWith("/.reserved")) {
+      return false;
+    }
+    if (src.contains("/.snapshot")) {
+      return false;
+    }
+    if (provider != null) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * FGL_IIP path for {@code setPermission}. Acquires {@code PATH_WRITE}
+   * (read locks on ancestors, write lock on the target) and invokes
+   * the pre-resolved-IIP overload of {@link FSDirAttrOp#setPermission}.
+   *
+   * <p>Phase B envelope (under held PATH_WRITE):
+   * <ul>
+   *   <li>target must exist (otherwise fall back so legacy can raise
+   *       the right {@code FileNotFoundException});</li>
+   *   <li>no ancestor snapshot involvement (setPermission with a
+   *       non-CURRENT snapshot id is out of pilot scope);</li>
+   *   <li>no ancestor has quota or non-default storage policy (mirrors
+   *       create-class envelope for consistency).</li>
+   * </ul>
+   *
+   * @throws PilotEnvelopeMissException on structural misses during
+   *         the walk (symlink in ancestor, INode reference)
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  private FileStatus setPermissionPilot(String src, FsPermission permission,
+      FSPermissionChecker pc) throws IOException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot set permission for " + src);
+
+      INodesInPath iip = lip.iip();
+
+      // Phase B envelope: target must exist and no snapshot
+      // involvement on any ancestor.
+      if (iip.getLastINode() == null) {
+        return null;  // fall back — legacy produces the right FNE
+      }
+      for (int i = 0; i < iip.length() - 1; i++) {
+        INode anc = iip.getINode(i);
+        if (anc == null) {
+          break;
+        }
+        if (anc.isDirectory()) {
+          INodeDirectory ad = anc.asDirectory();
+          if (ad.isSnapshottable() || ad.isWithSnapshot()) {
+            return null;
+          }
+          if (ad.isWithQuota()) {
+            return null;
+          }
+          if (ad.getLocalStoragePolicyID()
+              != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
+            return null;
+          }
+        }
+      }
+
+      return FSDirAttrOp.setPermission(dir, pc, iip, permission);
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException(
+          "setPermission interrupted on " + src);
+    }
   }
 
   /**
