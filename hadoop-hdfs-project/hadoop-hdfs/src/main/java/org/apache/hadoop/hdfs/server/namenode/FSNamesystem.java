@@ -2616,22 +2616,72 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+
+    // HDFS-17385 Phase II pilot: PATH_WRITE path.
+    boolean pilotHandled = false;
+    if (canUsePilotPathWrite(src)) {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot set times " + src);
-        auditStat = FSDirAttrOp.setTimes(dir, pc, src, mtime, atime);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        auditStat = setTimesPilot(src, mtime, atime, pc);
+        if (auditStat != null) {
+          pilotHandled = true;
+        }
+      } catch (PilotEnvelopeMissException pem) {
+        // Envelope miss — fall through to legacy.
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
+    }
+
+    if (!pilotHandled) {
+      try {
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot set times " + src);
+          auditStat = FSDirAttrOp.setTimes(dir, pc, src, mtime, atime);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
+      }
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
+  }
+
+  /**
+   * FGL_IIP path for {@code setTimes}. Same envelope shape as
+   * setPermission / setOwner; permission requirement is WRITE on
+   * the target (mirrors legacy).
+   *
+   * @throws PilotEnvelopeMissException on structural misses
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  private FileStatus setTimesPilot(String src, long mtime, long atime,
+      FSPermissionChecker pc) throws IOException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot set times " + src);
+
+      INodesInPath iip = lip.iip();
+      if (iip.getLastINode() == null) {
+        return null;
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        return null;
+      }
+
+      return FSDirAttrOp.setTimes(dir, pc, iip, mtime, atime);
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException(
+          "setTimes interrupted on " + src);
+    }
   }
 
   /**

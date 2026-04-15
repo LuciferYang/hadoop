@@ -205,6 +205,31 @@ public class FSDirAttrOp {
     return fsd.getAuditFileInfo(iip);
   }
 
+  /**
+   * FGL_IIP pilot overload. Caller has already acquired
+   * {@code PATH_WRITE} on {@code iip}. Permission requirement:
+   * write access on the target (mirrors legacy).
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  static FileStatus setTimes(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip, long mtime,
+      long atime) throws IOException {
+    fsd.writeLock();
+    try {
+      if (fsd.isPermissionEnabled()) {
+        fsd.checkPathAccess(pc, iip, FsAction.WRITE);
+      }
+      boolean changed = unprotectedSetTimes(fsd, iip, mtime, atime, true);
+      if (changed) {
+        fsd.getEditLog().logTimes(iip.getPath(), mtime, atime);
+      }
+    } finally {
+      fsd.writeUnlock();
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
   static boolean setReplication(
       FSDirectory fsd, FSPermissionChecker pc, BlockManager bm, String src,
       final short replication) throws IOException {

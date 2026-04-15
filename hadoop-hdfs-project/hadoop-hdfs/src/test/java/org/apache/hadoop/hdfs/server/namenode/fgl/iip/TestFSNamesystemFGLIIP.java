@@ -1820,6 +1820,155 @@ public class TestFSNamesystemFGLIIP {
           "unexpected final owner for file " + t);
     }
   }
+
+  // ======================================================================
+  // setTimes pilot path (PATH_WRITE).
+  // ======================================================================
+
+  /** Happy path: set both mtime and atime. */
+  @Test
+  @Timeout(60)
+  public void setTimesOnFileUpdatesBothTimes() throws Exception {
+    Path p = new Path("/st-both");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    long newMtime = 1_700_000_000_000L;
+    long newAtime = 1_700_000_001_000L;
+    fs.setTimes(p, newMtime, newAtime);
+    FileStatus status = fs.getFileStatus(p);
+    assertEquals(newMtime, status.getModificationTime());
+    assertEquals(newAtime, status.getAccessTime());
+  }
+
+  /** mtime=-1 leaves modification time untouched. */
+  @Test
+  @Timeout(60)
+  public void setTimesWithMtimeNegativeOneLeavesMtimeUnchanged()
+      throws Exception {
+    Path p = new Path("/st-mtime-skip");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    long origMtime = fs.getFileStatus(p).getModificationTime();
+    long newAtime = 1_700_000_002_000L;
+    fs.setTimes(p, -1, newAtime);
+    FileStatus status = fs.getFileStatus(p);
+    assertEquals(origMtime, status.getModificationTime(),
+        "mtime=-1 must leave modification time untouched");
+    assertEquals(newAtime, status.getAccessTime());
+  }
+
+  /** Missing target → FileNotFoundException. */
+  @Test
+  @Timeout(60)
+  public void setTimesOnMissingTargetFails() throws Exception {
+    assertThrows(FileNotFoundException.class,
+        () -> fs.setTimes(new Path("/st-missing"), 123L, 456L));
+  }
+
+  /** Non-writer user is rejected by the WRITE-permission check. */
+  @Test
+  @Timeout(60)
+  public void setTimesRespectsPathAccessWrite() throws Exception {
+    Path parent = new Path("/st-perm");
+    fs.mkdirs(parent);
+    Path p = new Path(parent, "file");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    // 0644 — non-owner has no write access.
+    fs.setPermission(p, new FsPermission((short) 0644));
+
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser("st-other-user");
+    final URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    other.doAs((PrivilegedExceptionAction<Void>) () -> {
+      DistributedFileSystem otherFs = (DistributedFileSystem)
+          FileSystem.get(clusterUri, otherConf);
+      try {
+        assertThrows(AccessControlException.class,
+            () -> otherFs.setTimes(p, 9_000_000L, 9_000_000L));
+      } finally {
+        otherFs.close();
+      }
+      return null;
+    });
+  }
+
+  /** /.snapshot paths fall back and get rejected by legacy. */
+  @Test
+  @Timeout(60)
+  public void setTimesSnapshotPathFallsBackToLegacy() throws Exception {
+    Path dir = new Path("/st-snap-parent");
+    fs.mkdirs(dir);
+    fs.allowSnapshot(dir);
+    Path f = new Path(dir, "data");
+    try (FSDataOutputStream out = fs.create(f)) {
+      out.write(new byte[8]);
+    }
+    fs.createSnapshot(dir, "s1");
+    Path snapFile = new Path(dir, ".snapshot/s1/data");
+    assertThrows(IOException.class,
+        () -> fs.setTimes(snapFile, 100L, 200L));
+  }
+
+  /** 16 threads setTimes on their own files in parallel. */
+  @Test
+  @Timeout(120)
+  public void parallelSetTimesDisjointTargets() throws Exception {
+    final int numThreads = 16;
+    for (int t = 0; t < numThreads; t++) {
+      Path p = new Path("/st-parallel/f" + t);
+      fs.mkdirs(p.getParent());
+      try (FSDataOutputStream out = fs.create(p)) {
+        out.write(new byte[4]);
+      }
+    }
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < 20; i++) {
+              long mt = 1_700_000_000_000L + tid * 1000L + i;
+              fs.setTimes(new Path("/st-parallel/f" + tid), mt, -1);
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
+    // Final mtime for each file is the last iteration's (i=19).
+    for (int t = 0; t < numThreads; t++) {
+      long expected = 1_700_000_000_000L + t * 1000L + 19;
+      assertEquals(expected,
+          fs.getFileStatus(new Path("/st-parallel/f" + t))
+              .getModificationTime(),
+          "unexpected final mtime for file " + t);
+    }
+  }
 }
 
 
