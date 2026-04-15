@@ -2303,24 +2303,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       if (iip.getLastINode() == null) {
         return null;  // fall back — legacy produces the right FNE
       }
-      for (int i = 0; i < iip.length() - 1; i++) {
-        INode anc = iip.getINode(i);
-        if (anc == null) {
-          break;
-        }
-        if (anc.isDirectory()) {
-          INodeDirectory ad = anc.asDirectory();
-          if (ad.isSnapshottable() || ad.isWithSnapshot()) {
-            return null;
-          }
-          if (ad.isWithQuota()) {
-            return null;
-          }
-          if (ad.getLocalStoragePolicyID()
-              != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
-            return null;
-          }
-        }
+      if (!ancestorsAllowMutate(iip)) {
+        return null;
       }
 
       return FSDirAttrOp.setPermission(dir, pc, iip, permission);
@@ -3198,30 +3182,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       if (parent == null || !parent.isDirectory()) {
         return null;
       }
-      INodeDirectory parentDir = parent.asDirectory();
-      if (parentDir.isWithQuota()) {
-        return null;  // quota-bearing directory — envelope reject
-      }
-      if (parentDir.getLocalStoragePolicyID()
-          != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
-        return null;  // non-default storage policy on ancestor
-      }
-      // Check every ancestor for quota / non-default storage policy.
-      for (int i = 0; i < iip.length() - 1; i++) {
-        INode anc = iip.getINode(i);
-        if (anc == null) {
-          break;
-        }
-        if (anc.isDirectory()) {
-          INodeDirectory ad = anc.asDirectory();
-          if (ad.isWithQuota()) {
-            return null;
-          }
-          if (ad.getLocalStoragePolicyID()
-              != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
-            return null;
-          }
-        }
+      if (!ancestorsAllowCreate(iip)) {
+        return null;
       }
 
       // Target must be absent (pilot doesn't handle existing target).
@@ -3956,27 +3918,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       if (parent == null || !parent.isDirectory()) {
         return null;  // legacy will produce the right FNE/PNDE
       }
-      for (int i = 0; i < iip.length() - 1; i++) {
-        INode anc = iip.getINode(i);
-        if (anc == null) {
-          break;
-        }
-        if (anc.isDirectory()) {
-          INodeDirectory ad = anc.asDirectory();
-          // Any snapshot involvement → fall back. Snapshot-aware
-          // delete is out of pilot scope (requires snapshot bookkeeping
-          // that the pilot's narrow lock doesn't protect).
-          if (ad.isSnapshottable() || ad.isWithSnapshot()) {
-            return null;
-          }
-          if (ad.isWithQuota()) {
-            return null;
-          }
-          if (ad.getLocalStoragePolicyID()
-              != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
-            return null;
-          }
-        }
+      if (!ancestorsAllowMutate(iip)) {
+        return null;
       }
 
       // Target must exist and be a regular file. Directories,
@@ -4281,6 +4224,74 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
   }
 
   /**
+   * Shared Phase-B structural check for create-class pilot RPCs
+   * ({@code startFile}, {@code mkdirs}). Returns {@code true} only if
+   * every ancestor directory on the IIP has default storage policy
+   * and no quota. A non-{@code CURRENT} snapshot on an ancestor is
+   * tolerable here: the new INode being created isn't in any snapshot,
+   * so snapshot bookkeeping has no work to do.
+   *
+   * <p>Returns {@code false} signals the caller to fall through to
+   * the legacy path (which handles quota / storage policy correctly).
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
+   */
+  private boolean ancestorsAllowCreate(INodesInPath iip) {
+    for (int i = 0; i < iip.length() - 1; i++) {
+      INode anc = iip.getINode(i);
+      if (anc == null) {
+        break;
+      }
+      if (anc.isDirectory()) {
+        INodeDirectory ad = anc.asDirectory();
+        if (ad.isWithQuota()) {
+          return false;
+        }
+        if (ad.getLocalStoragePolicyID()
+            != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Shared Phase-B structural check for mutate-class pilot RPCs
+   * ({@code delete}, {@code setPermission}, {@code setOwner},
+   * {@code setTimes}, {@code setReplication}). Rejects any ancestor
+   * that has a snapshot feature, quota, or non-default storage policy.
+   * Snapshot involvement changes the semantics of
+   * {@code recordModification} — mutations under a snapshottable or
+   * snapshot-bearing ancestor participate in snapshot bookkeeping
+   * that the pilot's narrow lock does not cover.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
+   */
+  private boolean ancestorsAllowMutate(INodesInPath iip) {
+    for (int i = 0; i < iip.length() - 1; i++) {
+      INode anc = iip.getINode(i);
+      if (anc == null) {
+        break;
+      }
+      if (anc.isDirectory()) {
+        INodeDirectory ad = anc.asDirectory();
+        if (ad.isSnapshottable() || ad.isWithSnapshot()) {
+          return false;
+        }
+        if (ad.isWithQuota()) {
+          return false;
+        }
+        if (ad.getLocalStoragePolicyID()
+            != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
    * Create all the necessary directories
    */
   boolean mkdirs(String src, PermissionStatus permissions,
@@ -4408,29 +4419,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
         // full multi-level creation logic.
         return null;
       }
-      INodeDirectory parentDir = parent.asDirectory();
-      if (parentDir.isWithQuota()) {
+      if (!ancestorsAllowCreate(iip)) {
         return null;
-      }
-      if (parentDir.getLocalStoragePolicyID()
-          != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
-        return null;
-      }
-      for (int i = 0; i < iip.length() - 1; i++) {
-        INode anc = iip.getINode(i);
-        if (anc == null) {
-          break;
-        }
-        if (anc.isDirectory()) {
-          INodeDirectory ad = anc.asDirectory();
-          if (ad.isWithQuota()) {
-            return null;
-          }
-          if (ad.getLocalStoragePolicyID()
-              != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
-            return null;
-          }
-        }
       }
 
       // Permission checks: traversal (execute) on every ancestor PLUS
