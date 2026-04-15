@@ -3128,7 +3128,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       dir.checkTraverse(pc, iip, DirOp.CREATE);
       if (dir.isPermissionEnabled()) {
         dir.checkAncestorAccess(pc, iip,
-            org.apache.hadoop.fs.permission.FsAction.WRITE);
+            FsAction.WRITE);
       }
 
       // Verify parent directory unless createParent is set (mirrors
@@ -3725,20 +3725,44 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
     boolean ret = false;
-    try {
-      writeLock(RwLockMode.GLOBAL);
+
+    // HDFS-17385 Phase II pilot: try the FGL_IIP PARENT_WRITE path
+    // first for single-file deletes (pilot scope). Any envelope miss
+    // falls through to the legacy writeLock(GLOBAL) path.
+    boolean pilotHandled = false;
+    if (canUsePilotDelete(src)) {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot delete " + src);
-        toRemovedBlocks = FSDirDeleteOp.delete(
-            this, pc, src, recursive, logRetryCache);
-        ret = toRemovedBlocks != null;
-      } finally {
-        writeUnlock(RwLockMode.GLOBAL, operationName, getLockReportInfoSupplier(src));
+        BlocksMapUpdateInfo[] holder = new BlocksMapUpdateInfo[1];
+        Boolean pilotRet = deletePilot(src, logRetryCache, holder, pc);
+        if (pilotRet != null) {
+          ret = pilotRet;
+          toRemovedBlocks = holder[0];
+          pilotHandled = true;
+        }
+      } catch (PilotEnvelopeMissException pem) {
+        // Fall through to legacy.
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
+    }
+
+    if (!pilotHandled) {
+      try {
+        writeLock(RwLockMode.GLOBAL);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot delete " + src);
+          toRemovedBlocks = FSDirDeleteOp.delete(
+              this, pc, src, recursive, logRetryCache);
+          ret = toRemovedBlocks != null;
+        } finally {
+          writeUnlock(RwLockMode.GLOBAL, operationName, getLockReportInfoSupplier(src));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
+      }
     }
     getEditLog().logSync();
     logAuditEvent(ret, operationName, src);
@@ -3747,6 +3771,128 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
           toRemovedBlocks.getToDeleteList());
     }
     return ret;
+  }
+
+  /**
+   * Envelope-A (lock-free) check for the FGL_IIP {@code delete} pilot.
+   * Pilot scope is intentionally narrow: single regular-file deletes
+   * under a simple (non-snapshot, non-quota, default-storage-policy)
+   * subtree. Anything else falls back to legacy.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
+   */
+  private boolean canUsePilotDelete(String src) {
+    if (!(fsLock instanceof IIPBasedFSNamesystemLock)) {
+      return false;
+    }
+    if (src == null || src.isEmpty()) {
+      return false;
+    }
+    if ("/".equals(src)) {
+      // Deleting root is never allowed; let legacy return false.
+      return false;
+    }
+    if (src.startsWith("/.reserved")) {
+      return false;
+    }
+    if (src.contains("/.snapshot")) {
+      return false;
+    }
+    if (provider != null) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * FGL_IIP path for {@code delete}. Acquires {@code PARENT_WRITE} on
+   * the target path, runs Phase B envelope checks, and delegates to
+   * {@link FSDirDeleteOp#deleteInternal}. The FS/GLOBAL
+   * {@code hasWriteLock} assertions in {@code deleteInternal} and
+   * {@code removeLeasesAndINodes} are satisfied by
+   * {@link IIPBasedFSNamesystemLock#hasWriteLock} returning true under
+   * held PARENT_WRITE (via
+   * {@code INodeLockManager.HELD_IIP_WRITE} — see the P4 prerequisite
+   * in the design spec §1.11).
+   *
+   * @return {@code true} if the pilot successfully deleted the target;
+   *         {@code false} if legacy returned {@code false}; {@code null}
+   *         if the call should fall back to the legacy path due to an
+   *         envelope miss discovered under held locks (the {@code holder}
+   *         parameter is set only on success).
+   * @throws PilotEnvelopeMissException on structural envelope misses
+   *         detected during the walk (symlink in ancestor, INode
+   *         reference, etc.)
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.10, §3.1
+   */
+  private Boolean deletePilot(String src, boolean logRetryCache,
+      BlocksMapUpdateInfo[] holder, FSPermissionChecker pc)
+      throws IOException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PARENT_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot delete " + src);
+
+      INodesInPath iip = lip.iip();
+
+      // Phase B envelope — parent + ancestor structural checks.
+      INode parent = iip.length() >= 2 ? iip.getINode(-2) : null;
+      if (parent == null || !parent.isDirectory()) {
+        return null;  // legacy will produce the right FNE/PNDE
+      }
+      for (int i = 0; i < iip.length() - 1; i++) {
+        INode anc = iip.getINode(i);
+        if (anc == null) {
+          break;
+        }
+        if (anc.isDirectory()) {
+          INodeDirectory ad = anc.asDirectory();
+          // Any snapshot involvement → fall back. Snapshot-aware
+          // delete is out of pilot scope (requires snapshot bookkeeping
+          // that the pilot's narrow lock doesn't protect).
+          if (ad.isSnapshottable() || ad.isWithSnapshot()) {
+            return null;
+          }
+          if (ad.isWithQuota()) {
+            return null;
+          }
+          if (ad.getLocalStoragePolicyID()
+              != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
+            return null;
+          }
+        }
+      }
+
+      // Target must exist and be a regular file. Directories,
+      // symlinks, and already-snapshotted files fall back to legacy.
+      INode target = iip.getLastINode();
+      if (target == null) {
+        // Legacy FSDirDeleteOp.delete with missing target: deleteAllowed
+        // returns false → deleteInternal returns null → delete returns
+        // false. Replicate that directly without falling back.
+        return Boolean.FALSE;
+      }
+      if (!target.isFile()) {
+        return null;  // dir / symlink / reference — out of pilot scope
+      }
+      if (target.asFile().isWithSnapshot()) {
+        return null;
+      }
+
+      // Permission check mirrors legacy FSDirDeleteOp.delete:
+      // parentAccess=WRITE, subAccess=ALL, ignoreEmptyDir=true. For a
+      // regular file target, subAccess is moot (no children to recurse).
+      if (dir.isPermissionEnabled()) {
+        dir.checkPermission(pc, iip, false, null,
+            FsAction.WRITE, null, FsAction.ALL, true);
+      }
+
+      holder[0] = FSDirDeleteOp.deleteInternal(this, iip, logRetryCache);
+      return holder[0] != null;
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException("delete interrupted on " + src);
+    }
   }
 
   FSPermissionChecker getPermissionChecker()

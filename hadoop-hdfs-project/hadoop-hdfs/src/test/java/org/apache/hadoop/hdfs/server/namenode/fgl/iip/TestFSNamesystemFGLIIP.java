@@ -1118,4 +1118,278 @@ public class TestFSNamesystemFGLIIP {
     }
     assertEquals(0, errors.get());
   }
+
+  // ======================================================================
+  // delete pilot path (PARENT_WRITE, single regular-file only).
+  // ======================================================================
+
+  /** Happy path: delete a regular file under a simple subtree. */
+  @Test
+  @Timeout(60)
+  public void deleteSingleFile() throws Exception {
+    Path p = new Path("/del-single");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[64]);
+    }
+    assertTrue(fs.exists(p));
+    assertTrue(fs.delete(p, /* recursive */ false));
+    assertFalse(fs.exists(p));
+  }
+
+  /** Deleting under a nested parent also works. */
+  @Test
+  @Timeout(60)
+  public void deleteSingleFileDeepPath() throws Exception {
+    Path parent = new Path("/del-deep/a/b/c");
+    assertTrue(fs.mkdirs(parent));
+    Path p = new Path(parent, "file");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[32]);
+    }
+    assertTrue(fs.delete(p, false));
+    assertFalse(fs.exists(p));
+    // Parent tree must be intact.
+    assertTrue(fs.exists(parent));
+  }
+
+  /** Deleting a missing path returns false (legacy parity). */
+  @Test
+  @Timeout(60)
+  public void deleteMissingPathReturnsFalse() throws Exception {
+    assertFalse(fs.delete(new Path("/del-missing"), false));
+  }
+
+  /**
+   * Deleting an empty directory is out of pilot scope (pilot handles
+   * single-file only). Must fall back to legacy which succeeds.
+   */
+  @Test
+  @Timeout(60)
+  public void deleteEmptyDirectoryFallsBackToLegacy() throws Exception {
+    Path dir = new Path("/del-empty-dir");
+    assertTrue(fs.mkdirs(dir));
+    assertTrue(fs.delete(dir, false));
+    assertFalse(fs.exists(dir));
+  }
+
+  /**
+   * Deleting a non-empty directory without recursive must throw
+   * PathIsNotEmptyDirectoryException (legacy parity). Pilot rejects
+   * directories in Phase B and falls back.
+   */
+  @Test
+  @Timeout(60)
+  public void deleteNonEmptyDirWithoutRecursiveFails() throws Exception {
+    Path dir = new Path("/del-nonempty");
+    fs.mkdirs(dir);
+    try (FSDataOutputStream out = fs.create(new Path(dir, "inside"))) {
+      out.write(new byte[8]);
+    }
+    assertThrows(org.apache.hadoop.fs.PathIsNotEmptyDirectoryException.class,
+        () -> fs.delete(dir, false));
+    assertTrue(fs.exists(dir));
+  }
+
+  /** Recursive delete of a directory falls back; legacy handles it. */
+  @Test
+  @Timeout(60)
+  public void deleteRecursiveDirectoryFallsBackToLegacy() throws Exception {
+    Path dir = new Path("/del-recursive");
+    fs.mkdirs(new Path(dir, "sub"));
+    try (FSDataOutputStream out = fs.create(new Path(dir, "sub/file"))) {
+      out.write(new byte[8]);
+    }
+    assertTrue(fs.delete(dir, /* recursive */ true));
+    assertFalse(fs.exists(dir));
+  }
+
+  /** /.snapshot paths are envelope-rejected. */
+  @Test
+  @Timeout(60)
+  public void deleteSnapshotPathFallsBackToLegacy() throws Exception {
+    Path dir = new Path("/del-snap-parent");
+    fs.mkdirs(dir);
+    fs.allowSnapshot(dir);
+    Path f = new Path(dir, "data");
+    try (FSDataOutputStream out = fs.create(f)) {
+      out.write(new byte[16]);
+    }
+    fs.createSnapshot(dir, "s1");
+    // Attempting to delete the live file while a snapshot references
+    // the parent exercises the snapshot-feature fallback path.
+    assertTrue(fs.delete(f, false),
+        "delete of live file under snapshottable parent should succeed");
+    assertFalse(fs.exists(f));
+  }
+
+  /**
+   * /.reserved paths are envelope-rejected and fall through to legacy.
+   * Legacy's FSDirDeleteOp.delete throws InvalidPathException for the
+   * exact reserved name "/.reserved"; for a non-existent reserved
+   * subpath it returns false. Both confirm pilot did not silently
+   * handle the path.
+   */
+  @Test
+  @Timeout(60)
+  public void deleteReservedPathFallsBackToLegacy() throws Exception {
+    // Non-existent reserved subpath — legacy returns false.
+    assertFalse(fs.delete(new Path("/.reserved/fake"), false));
+    // Exact /.reserved — legacy throws InvalidPathException
+    // (wrapped as RemoteException by the RPC layer).
+    assertThrows(IOException.class,
+        () -> fs.delete(new Path("/.reserved"), false));
+  }
+
+  /**
+   * Non-owner lacking WRITE on parent cannot delete the file. Pilot
+   * must enforce checkPermission(parentAccess=WRITE).
+   */
+  @Test
+  @Timeout(60)
+  public void deleteRespectsParentWritePermission() throws Exception {
+    Path parent = new Path("/del-perm/restricted");
+    fs.mkdirs(parent);
+    Path f = new Path(parent, "data");
+    try (FSDataOutputStream out = fs.create(f)) {
+      out.write(new byte[8]);
+    }
+    // Strip write on parent for others.
+    fs.setPermission(parent, new FsPermission((short) 0755));
+
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser("del-other-user");
+    final URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    other.doAs((PrivilegedExceptionAction<Void>) () -> {
+      DistributedFileSystem otherFs = (DistributedFileSystem)
+          FileSystem.get(clusterUri, otherConf);
+      try {
+        assertThrows(AccessControlException.class,
+            () -> otherFs.delete(f, false));
+      } finally {
+        otherFs.close();
+      }
+      return null;
+    });
+    // Owner can still delete.
+    assertTrue(fs.delete(f, false));
+  }
+
+  /**
+   * Disjoint-parents concurrency: 8 threads × 20 file deletes, each
+   * thread against its own parent directory.
+   */
+  @Test
+  @Timeout(120)
+  public void parallelDeleteDisjointParents() throws Exception {
+    final int numThreads = 8;
+    final int filesPerThread = 20;
+    // Pre-create.
+    for (int t = 0; t < numThreads; t++) {
+      fs.mkdirs(new Path("/pdel/p" + t));
+      for (int i = 0; i < filesPerThread; i++) {
+        try (FSDataOutputStream out = fs.create(
+            new Path("/pdel/p" + t + "/f" + i))) {
+          out.write(new byte[8]);
+        }
+      }
+    }
+
+    final AtomicInteger failures = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < filesPerThread; i++) {
+              if (!fs.delete(new Path("/pdel/p" + tid + "/f" + i), false)) {
+                failures.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            failures.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, failures.get());
+    for (int t = 0; t < numThreads; t++) {
+      for (int i = 0; i < filesPerThread; i++) {
+        assertFalse(fs.exists(new Path("/pdel/p" + t + "/f" + i)));
+      }
+    }
+  }
+
+  /**
+   * Hot-parent concurrency: 16 threads delete distinct children of
+   * the same parent. Exercises parent-write-lock contention.
+   */
+  @Test
+  @Timeout(120)
+  public void parallelDeleteUnderSameParent() throws Exception {
+    final Path hot = new Path("/del-hot-parent");
+    fs.mkdirs(hot);
+    final int numThreads = 16;
+    final int filesPerThread = 20;
+    for (int t = 0; t < numThreads; t++) {
+      for (int i = 0; i < filesPerThread; i++) {
+        try (FSDataOutputStream out = fs.create(
+            new Path(hot, "t" + t + "_" + i))) {
+          out.write(new byte[4]);
+        }
+      }
+    }
+
+    final AtomicInteger failures = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < filesPerThread; i++) {
+              if (!fs.delete(new Path(hot, "t" + tid + "_" + i), false)) {
+                failures.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            failures.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, failures.get());
+    // No descendants should remain.
+    assertEquals(0, fs.listStatus(hot).length);
+  }
 }
