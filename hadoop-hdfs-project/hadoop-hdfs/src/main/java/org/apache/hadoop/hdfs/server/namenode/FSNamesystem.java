@@ -3185,7 +3185,10 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
         () -> startFilePilot(src, permissions, holder, clientMachine,
             flag, createParent, replication, blockSize, pc, logRetryCache),
         "create", src, /* auditOnAce */ false);
-    if (pr.handled && pr.value != null) {
+    if (pr.handled) {
+      // startFilePilot never returns null — Phase-B misses throw
+      // PilotEnvelopeMissException and produce PilotResult.miss().
+      // A null stat here would indicate an unhandled bug in the pilot.
       return pr.value;
     }
 
