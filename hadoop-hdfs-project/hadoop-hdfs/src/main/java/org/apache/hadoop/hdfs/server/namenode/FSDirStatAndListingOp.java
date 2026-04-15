@@ -125,6 +125,21 @@ class FSDirStatAndListingOp {
     return !INodeFile.valueOf(iip.getLastINode(), src).isUnderConstruction();
   }
 
+  /**
+   * FGL_IIP pilot overload. The caller has already resolved the path
+   * via {@link org.apache.hadoop.hdfs.server.namenode.fgl.iip
+   * .IIPBasedFSNamesystemLock#lockPath} with {@code PATH_READ}, so the
+   * per-INode read locks are held and the IIP is populated. The pilot
+   * envelope has also rejected reserved/snapshot/encryption-zone
+   * paths, so this overload does not need to handle them.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
+   */
+  static boolean isFileClosed(FSDirectory fsd, INodesInPath iip, String src)
+      throws IOException {
+    return !INodeFile.valueOf(iip.getLastINode(), src).isUnderConstruction();
+  }
+
   static ContentSummary getContentSummary(
       FSDirectory fsd, FSPermissionChecker pc, String src) throws IOException {
     final INodesInPath iip = fsd.resolvePath(pc, src, DirOp.READ_LINK);

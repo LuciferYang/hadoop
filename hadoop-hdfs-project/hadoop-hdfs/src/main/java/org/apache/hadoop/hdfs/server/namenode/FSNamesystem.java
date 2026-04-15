@@ -2264,7 +2264,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     // path doesn't hit envelope-miss conditions. Fall through to the
     // legacy GLOBAL read-lock path on any miss.
     boolean pilotHandled = false;
-    if (canUsePilotGetBlockLocations(srcArg)) {
+    if (canUsePilotPathRead(srcArg)) {
       try {
         res = getBlockLocationsPilot(srcArg, offset, length, pc);
         pilotHandled = true;
@@ -2328,32 +2328,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     LocatedBlocks blocks = res.blocks;
     sortLocatedBlocks(clientMachine, blocks);
     return blocks;
-  }
-
-  /**
-   * Envelope-A (lock-free) check for the FGL_IIP
-   * {@code getBlockLocations} pilot path.
-   *
-   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
-   */
-  private boolean canUsePilotGetBlockLocations(String src) {
-    if (!(fsLock instanceof
-        IIPBasedFSNamesystemLock)) {
-      return false;
-    }
-    if (src == null || src.isEmpty()) {
-      return false;
-    }
-    if (src.startsWith("/.reserved")) {
-      return false;
-    }
-    if (src.contains("/.snapshot")) {
-      return false;
-    }
-    if (provider != null) {
-      return false;
-    }
-    return true;
   }
 
   /**
@@ -3842,9 +3816,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     // doesn't hit envelope-miss conditions. Fall through to the
     // legacy FS read-lock path on any miss.
     boolean pilotHandled = false;
-    if (fsLock instanceof
-        IIPBasedFSNamesystemLock
-        && canUsePilotGetFileInfo(src)) {
+    if (canUsePilotPathRead(src)) {
       try {
         stat = getFileInfoPilot(src, resolveLink, needLocation, needBlockToken,
             pc);
@@ -3878,27 +3850,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     }
     logAuditEvent(true, operationName, src);
     return stat;
-  }
-
-  /**
-   * Envelope check for the FGL_IIP {@code getFileInfo} pilot path.
-   * Returns {@code true} only for paths that the pilot's hand-over-hand
-   * walk can handle safely. Paths that are snapshots, reserved, or
-   * otherwise special are rejected and fall back to the legacy code
-   * path.
-   */
-  private boolean canUsePilotGetFileInfo(String src) {
-    if (src == null || src.isEmpty()) {
-      return false;
-    }
-    if (src.startsWith("/.reserved")) {
-      // /.reserved/.inodes, /.reserved/raw — not handled in pilot.
-      return false;
-    }
-    if (src.contains("/.snapshot")) {
-      return false;
-    }
-    return true;
   }
 
   /**
@@ -3967,22 +3918,104 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
     boolean success = false;
-    try {
-      readLock(RwLockMode.FS);
+
+    // HDFS-17385 Phase II pilot: try FGL_IIP PATH_READ first.
+    boolean pilotHandled = false;
+    if (canUsePilotPathRead(src)) {
       try {
-        checkOperation(OperationCategory.READ);
-        success = FSDirStatAndListingOp.isFileClosed(dir, pc, src);
-      } finally {
-        readUnlock(RwLockMode.FS, operationName, getLockReportInfoSupplier(src));
+        success = isFileClosedPilot(src, pc);
+        pilotHandled = true;
+      } catch (PilotEnvelopeMissException pem) {
+        // Envelope miss — fall through to legacy path.
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
+    }
+
+    if (!pilotHandled) {
+      try {
+        readLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.READ);
+          success = FSDirStatAndListingOp.isFileClosed(dir, pc, src);
+        } finally {
+          readUnlock(RwLockMode.FS, operationName, getLockReportInfoSupplier(src));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
+      }
     }
     if (success) {
       logAuditEvent(true, operationName, src);
     }
     return success;
+  }
+
+  /**
+   * FGL_IIP path for {@code isFileClosed}. Acquires {@code PATH_READ},
+   * runs the traversal permission check, and invokes the
+   * pre-resolved-IIP overload of
+   * {@link FSDirStatAndListingOp#isFileClosed(FSDirectory, INodesInPath, String)}.
+   *
+   * @throws PilotEnvelopeMissException on structural envelope misses
+   *         detected during the walk (symlink in ancestor, INode
+   *         reference, etc.)
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
+   */
+  private boolean isFileClosedPilot(String src, FSPermissionChecker pc)
+      throws IOException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_READ)) {
+      checkOperation(OperationCategory.READ);
+      // Mirror legacy fsd.resolvePath(pc, src, DirOp.READ) permission
+      // side: checkTraverse. PNDE → ACE conversion matches legacy
+      // resolvePath:752-758 for non-superuser (same as getFileInfo U8a
+      // Round-8 BUG #4 fix); superuser gets PNDE passed through as-is
+      // because isFileClosed has no null-return semantic.
+      try {
+        dir.checkTraverse(pc, lip.iip(), DirOp.READ);
+      } catch (org.apache.hadoop.fs.ParentNotDirectoryException pnde) {
+        if (pc.isSuperUser()) {
+          throw pnde;
+        }
+        throw new AccessControlException(pnde.getMessage());
+      }
+      return FSDirStatAndListingOp.isFileClosed(dir, lip.iip(), src);
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException(
+          "isFileClosed interrupted on " + src);
+    }
+  }
+
+  /**
+   * Shared Phase-A envelope check for read-only pilot RPCs that take
+   * {@code PATH_READ}. Extracted from {@code canUsePilotGetFileInfo}
+   * and {@code canUsePilotGetBlockLocations} which performed identical
+   * checks. Extracting now (rather than batching for the §6.3 RPC-10
+   * gate) avoids a third copy appearing with {@code isFileClosed}.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
+   */
+  private boolean canUsePilotPathRead(String src) {
+    if (!(fsLock instanceof IIPBasedFSNamesystemLock)) {
+      return false;
+    }
+    if (src == null || src.isEmpty()) {
+      return false;
+    }
+    if (src.startsWith("/.reserved")) {
+      return false;
+    }
+    if (src.contains("/.snapshot")) {
+      return false;
+    }
+    if (provider != null) {
+      return false;
+    }
+    return true;
   }
 
   /**

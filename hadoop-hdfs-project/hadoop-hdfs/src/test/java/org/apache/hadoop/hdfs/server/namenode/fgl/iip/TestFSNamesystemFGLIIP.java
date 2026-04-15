@@ -977,4 +977,145 @@ public class TestFSNamesystemFGLIIP {
     }
     assertEquals(0, errors.get());
   }
+
+  // ======================================================================
+  // isFileClosed pilot path (PATH_READ).
+  // ======================================================================
+
+  /** Closed file: legacy returns true; pilot must do the same. */
+  @Test
+  @Timeout(60)
+  public void isFileClosedOnClosedFile() throws Exception {
+    Path p = new Path("/ifc-closed");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[64]);
+    }
+    assertTrue(fs.isFileClosed(p));
+  }
+
+  /**
+   * File under construction (writer still holds the lease). The pilot
+   * must return false before close, and true after.
+   */
+  @Test
+  @Timeout(60)
+  public void isFileClosedWhileUnderConstruction() throws Exception {
+    Path p = new Path("/ifc-open");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[32]);
+      out.hflush();
+      assertFalse(fs.isFileClosed(p),
+          "pilot should observe under-construction state");
+    }
+    assertTrue(fs.isFileClosed(p));
+  }
+
+  /** Missing path throws FileNotFoundException (legacy parity). */
+  @Test
+  @Timeout(60)
+  public void isFileClosedOnMissingFileFails() throws Exception {
+    assertThrows(FileNotFoundException.class,
+        () -> fs.isFileClosed(new Path("/ifc-missing")));
+  }
+
+  /** isFileClosed on a directory fails (legacy parity). */
+  @Test
+  @Timeout(60)
+  public void isFileClosedOnDirectoryFails() throws Exception {
+    Path dir = new Path("/ifc-dir");
+    fs.mkdirs(dir);
+    assertThrows(IOException.class, () -> fs.isFileClosed(dir));
+  }
+
+  /** /.snapshot paths are envelope-rejected; legacy handles them. */
+  @Test
+  @Timeout(60)
+  public void isFileClosedSnapshotPathFallsBackToLegacy() throws Exception {
+    Path dir = new Path("/ifc-snap-parent");
+    fs.mkdirs(dir);
+    fs.allowSnapshot(dir);
+    Path f = new Path(dir, "data");
+    try (FSDataOutputStream out = fs.create(f)) {
+      out.write(new byte[16]);
+    }
+    fs.createSnapshot(dir, "s1");
+    Path snapFile = new Path(dir, ".snapshot/s1/data");
+    assertTrue(fs.isFileClosed(snapFile));
+  }
+
+  /** Non-owner lacking execute on ancestor cannot call isFileClosed. */
+  @Test
+  @Timeout(60)
+  public void isFileClosedRespectsTraversalPermission() throws Exception {
+    Path restricted = new Path("/ifc-perm/restricted");
+    Path inner = new Path(restricted, "inner");
+    fs.mkdirs(inner);
+    Path f = new Path(inner, "data");
+    try (FSDataOutputStream out = fs.create(f)) {
+      out.write(new byte[8]);
+    }
+    fs.setPermission(restricted, new FsPermission((short) 0700));
+
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser("ifc-other-user");
+    final URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    other.doAs((PrivilegedExceptionAction<Void>) () -> {
+      DistributedFileSystem otherFs = (DistributedFileSystem)
+          FileSystem.get(clusterUri, otherConf);
+      try {
+        assertThrows(AccessControlException.class,
+            () -> otherFs.isFileClosed(f));
+      } finally {
+        otherFs.close();
+      }
+      return null;
+    });
+  }
+
+  /** 16 threads hammer isFileClosed on the same closed file. */
+  @Test
+  @Timeout(120)
+  public void parallelIsFileClosedOnSameFile() throws Exception {
+    Path p = new Path("/ifc-hot");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[256]);
+    }
+    final int numThreads = 16;
+    final int requestsPerThread = 100;
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < requestsPerThread; i++) {
+              if (!fs.isFileClosed(p)) {
+                errors.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(60, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
+  }
 }
