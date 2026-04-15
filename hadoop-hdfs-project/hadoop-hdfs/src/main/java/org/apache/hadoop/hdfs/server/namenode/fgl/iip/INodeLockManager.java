@@ -255,10 +255,16 @@ public final class INodeLockManager {
       throw new InvalidPathException(
           "mode " + mode + " requires a non-root path: " + path);
     }
-    // For PATH_READ, every locked level is a read. For PARENT_WRITE,
-    // the deepest locked level (the parent) gets the write lock.
-    final int writeLockDepth = (mode == IIPAcquireMode.PARENT_WRITE)
-        ? maxLockDepth : -1;
+    // For PATH_READ, every locked level is a read.
+    // For PARENT_WRITE, the deepest locked level (the parent) gets
+    // the write lock; the target below it is populated unlocked.
+    // For PATH_WRITE, the deepest locked level (the target) gets the
+    // write lock; all ancestors are read-locked.
+    // computeMaxLockDepth() returns parent-depth for PARENT_WRITE and
+    // target-depth for PATH_READ/PATH_WRITE, so writeLockDepth =
+    // maxLockDepth is the correct deepest-is-write rule for all write
+    // modes. Read modes get -1 (no depth matches, all locks are read).
+    final int writeLockDepth = mode.needsIIPWrite() ? maxLockDepth : -1;
 
     long deadlineNanos = computeDeadlineNanos(timeout);
 
@@ -387,21 +393,29 @@ public final class INodeLockManager {
   /**
    * Sentinel returned by {@link #computeMaxLockDepth} when the
    * requested mode is invalid for a given path length (e.g.,
-   * PARENT_WRITE on the root "/").
+   * PARENT_WRITE or PATH_WRITE on the root "/").
    */
   static final int INVALID_WRITE_DEPTH = Integer.MIN_VALUE;
 
   /**
    * @return the deepest zero-based depth that the walk should acquire
-   *         a lock at (the target for PATH_READ, the parent for
-   *         PARENT_WRITE), or {@link #INVALID_WRITE_DEPTH} if the mode
-   *         cannot be applied to a path of the given length.
+   *         a lock at (the target for PATH_READ/PATH_WRITE, the parent
+   *         for PARENT_WRITE), or {@link #INVALID_WRITE_DEPTH} if the
+   *         mode cannot be applied to a path of the given length.
    */
   @VisibleForTesting
   static int computeMaxLockDepth(IIPAcquireMode mode, int pathLen) {
     switch (mode) {
     case PATH_READ:
-      // Lock every level from root to target.
+      // Lock every level from root to target (read on all).
+      return pathLen - 1;
+    case PATH_WRITE:
+      // Lock every level from root to target; target gets write, all
+      // ancestors get read. Requires at least 2 components — the mode
+      // is meaningless on the root INode.
+      if (pathLen < 2) {
+        return INVALID_WRITE_DEPTH;
+      }
       return pathLen - 1;
     case PARENT_WRITE:
       // Parent is the second-to-last component. Only valid for paths
@@ -411,8 +425,8 @@ public final class INodeLockManager {
       }
       return pathLen - 2;
     default:
-      // PATH_WRITE, ANCESTOR_WRITE, RENAME_WRITE, GLOBAL_READ, ADMIN_META
-      // — not reachable because acquire() pre-checks isPilot().
+      // ANCESTOR_WRITE, RENAME_WRITE, GLOBAL_READ, ADMIN_META — not
+      // reachable because acquire() pre-checks isPilot().
       throw new IllegalStateException(
           "computeMaxLockDepth called with non-pilot mode: " + mode);
     }

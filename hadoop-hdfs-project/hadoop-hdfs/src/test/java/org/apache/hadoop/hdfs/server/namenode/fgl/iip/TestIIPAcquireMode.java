@@ -41,7 +41,9 @@ public class TestIIPAcquireMode {
 
   /** Expected pilot-implemented modes. Change with intent. */
   private static final Set<IIPAcquireMode> PILOT_MODES =
-      EnumSet.of(IIPAcquireMode.PATH_READ, IIPAcquireMode.PARENT_WRITE);
+      EnumSet.of(IIPAcquireMode.PATH_READ,
+          IIPAcquireMode.PARENT_WRITE,
+          IIPAcquireMode.PATH_WRITE);
 
   /** Expected fallback modes. Change with intent. */
   private static final Set<IIPAcquireMode> FALLBACK_MODES =
@@ -49,8 +51,7 @@ public class TestIIPAcquireMode {
 
   /** Expected deferred modes. Change with intent. */
   private static final Set<IIPAcquireMode> DEFERRED_MODES =
-      EnumSet.of(IIPAcquireMode.PATH_WRITE,
-          IIPAcquireMode.ANCESTOR_WRITE,
+      EnumSet.of(IIPAcquireMode.ANCESTOR_WRITE,
           IIPAcquireMode.RENAME_WRITE);
 
   /** Modes that take some per-INode write lock. */
@@ -152,25 +153,25 @@ public class TestIIPAcquireMode {
   }
 
   @Test
-  public void parentWriteIsTheOnlyPilotWriteMode() {
-    // Pilot modes: PATH_READ (no write) + PARENT_WRITE (write). So the
-    // pilot exercises exactly one write path. If a future change adds a
-    // second pilot write mode, this test will fail and force the author
-    // to update the pilot spec.
+  public void pilotExercisesTwoWriteModes() {
+    // Pilot modes: PATH_READ (no write) + PARENT_WRITE (parent write)
+    // + PATH_WRITE (target write). The pilot exercises two write
+    // patterns. If a future change adds a third pilot write mode,
+    // this test will fail and force the author to update the spec.
     long pilotWrites = PILOT_MODES.stream()
         .filter(IIPAcquireMode::needsIIPWrite)
         .count();
-    assertEquals(1, pilotWrites,
-        "pilot exercises exactly one IIP write pattern (PARENT_WRITE)");
+    assertEquals(2, pilotWrites,
+        "pilot exercises exactly two IIP write patterns "
+            + "(PARENT_WRITE, PATH_WRITE)");
   }
 
   @Test
   public void deferredModeSetMatchesSpec() {
-    // PATH_WRITE, ANCESTOR_WRITE, RENAME_WRITE are declared but not
-    // implemented in the pilot. Adding to or removing from this set is
-    // a taxonomy change that requires a spec update.
-    assertEquals(EnumSet.of(IIPAcquireMode.PATH_WRITE,
-            IIPAcquireMode.ANCESTOR_WRITE,
+    // ANCESTOR_WRITE, RENAME_WRITE are declared but not implemented.
+    // Adding to or removing from this set is a taxonomy change that
+    // requires a spec update.
+    assertEquals(EnumSet.of(IIPAcquireMode.ANCESTOR_WRITE,
             IIPAcquireMode.RENAME_WRITE),
         EnumSet.allOf(IIPAcquireMode.class).stream()
             .filter(IIPAcquireMode::isDeferred)

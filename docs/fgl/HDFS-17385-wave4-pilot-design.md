@@ -77,14 +77,16 @@ No code in `FSNamesystem` or RPC handlers branches on `dfs.namenode.lockmode`. D
 | Mode | Lock grid | Pilot? |
 |---|---|---|
 | `GLOBAL_READ` | compat-read | fallback only |
-| `PATH_READ` | ancestors read (root→leaf), target read | **yes** (`getFileInfo`) |
-| `PATH_WRITE` | ancestors read (root→leaf), target write | deferred |
-| `PARENT_WRITE` | ancestors read (root→leaf), parent write; new child created under parent's lock | **yes** (`create`) |
+| `PATH_READ` | ancestors read (root→leaf), target read | **yes** (`getFileInfo`, `getBlockLocations`, `isFileClosed`) |
+| `PATH_WRITE` | ancestors read (root→parent), target write | **yes** (`setPermission`, `setOwner`, `setTimes`, `setReplication`) |
+| `PARENT_WRITE` | ancestors read (root→parent's parent), parent write; new child created under parent's lock | **yes** (`create`, `mkdirs`, `delete` single-file) |
 | `ANCESTOR_WRITE` | ancestors read (root→target ancestor), subtree root write; descendants iterated without per-INode locks | deferred |
 | `RENAME_WRITE` | two paths; src-parent and dst-parent acquired in ascending-INode-ID order | deferred |
 | `ADMIN_META` | compat-write | fallback for admin RPCs |
 
-All seven modes are declared in the enum; five throw `UnsupportedOperationException` in the pilot. Adding a new mode requires editing this table and filing a follow-up ticket (mitigation #1: full taxonomy upfront).
+All seven modes are declared in the enum; the two still-deferred modes throw `UnsupportedOperationException` in the pilot. Adding a new mode requires editing this table and filing a follow-up ticket (mitigation #1: full taxonomy upfront).
+
+`PATH_WRITE` was originally DEFERRED in the initial pilot cut and promoted to PILOT ahead of the §6.3 RPC-10 refactor gate. Front-loading the mode gives the gate review a third data-point mode (alongside `PATH_READ` and `PARENT_WRITE`) rather than five post-pilot RPCs discovering `PATH_WRITE` after the pattern is frozen.
 
 ### 1.5 Pilot envelope for `create`
 

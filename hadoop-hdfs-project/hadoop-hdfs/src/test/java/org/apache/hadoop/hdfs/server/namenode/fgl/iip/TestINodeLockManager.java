@@ -270,13 +270,115 @@ public class TestINodeLockManager {
     assertEquals(Integer.valueOf(0), INodeLockManager.HELD_IIP_DEPTH.get());
   }
 
+  // -------- PATH_WRITE walks --------
+
+  @Test
+  @Timeout(10)
+  public void pathWriteOnShallowTarget() throws Exception {
+    // /e (file directly under root). PATH_WRITE locks root read + e write.
+    try (LockedIIP lip = mgr.acquire("/e", IIPAcquireMode.PATH_WRITE)) {
+      INodesInPath iip = lip.iip();
+      assertEquals(2, iip.length());
+      assertEquals(root, iip.getINode(0));
+      assertEquals(e, iip.getINode(1));
+      // 2 locks: read root, write e.
+      assertEquals(2, pool.size());
+      // HELD_IIP_WRITE must be true so FSNamesystem.hasWriteLock(FS)
+      // assertions pass for PATH_WRITE callers.
+      assertTrue(INodeLockManager.HELD_IIP_WRITE.get(),
+          "HELD_IIP_WRITE must be set under PATH_WRITE");
+    }
+    assertEquals(0, pool.size());
+    assertFalse(INodeLockManager.HELD_IIP_WRITE.get(),
+        "HELD_IIP_WRITE must be cleared after close");
+  }
+
+  @Test
+  @Timeout(10)
+  public void pathWriteOnDeepTarget() throws Exception {
+    // /a/b/c (file 3 levels deep). PATH_WRITE locks root read + a read
+    // + b read + c write.
+    try (LockedIIP lip = mgr.acquire("/a/b/c", IIPAcquireMode.PATH_WRITE)) {
+      INodesInPath iip = lip.iip();
+      assertEquals(4, iip.length());
+      assertEquals(root, iip.getINode(0));
+      assertEquals(a, iip.getINode(1));
+      assertEquals(b, iip.getINode(2));
+      assertEquals(c, iip.getINode(3));
+      // 4 locks: read root, read a, read b, write c.
+      assertEquals(4, pool.size());
+    }
+    assertEquals(0, pool.size());
+  }
+
+  @Test
+  @Timeout(10)
+  public void pathWriteOnTargetDirectory() throws Exception {
+    // PATH_WRITE on a directory target (e.g., /a/b). Locks root read,
+    // a read, b write. Useful for setPermission / setOwner on dirs.
+    try (LockedIIP lip = mgr.acquire("/a/b", IIPAcquireMode.PATH_WRITE)) {
+      INodesInPath iip = lip.iip();
+      assertEquals(3, iip.length());
+      assertEquals(b, iip.getINode(2));
+      assertEquals(3, pool.size());
+    }
+    assertEquals(0, pool.size());
+  }
+
+  @Test
+  @Timeout(10)
+  public void pathWriteOnMissingTargetLeavesNullInIIP() throws Exception {
+    // If the target does not exist, the walk stops early and the IIP
+    // has null at the last slot. Caller must handle absent-target
+    // semantics (e.g., throw FileNotFoundException).
+    try (LockedIIP lip = mgr.acquire("/a/missing",
+        IIPAcquireMode.PATH_WRITE)) {
+      INodesInPath iip = lip.iip();
+      assertEquals(3, iip.length());
+      assertEquals(root, iip.getINode(0));
+      assertEquals(a, iip.getINode(1));
+      assertNull(iip.getINode(2));
+      // Only root and a acquired; no lock on the missing target.
+      assertEquals(2, pool.size());
+    }
+    assertEquals(0, pool.size());
+  }
+
+  @Test
+  @Timeout(10)
+  public void pathWriteOnRootRejected() {
+    assertThrows(InvalidPathException.class,
+        () -> mgr.acquire("/", IIPAcquireMode.PATH_WRITE));
+    assertEquals(0, pool.size(), "no locks should leak on rejection");
+    assertEquals(0, compat.getReadHoldCount(),
+        "compat-read should not leak on rejection");
+    assertEquals(Integer.valueOf(0), INodeLockManager.HELD_IIP_DEPTH.get());
+  }
+
+  @Test
+  @Timeout(10)
+  public void computeMaxLockDepthPathWrite() {
+    // "/a/b" → length 3 → target at idx 2 (write).
+    assertEquals(2,
+        INodeLockManager.computeMaxLockDepth(IIPAcquireMode.PATH_WRITE, 3));
+    // "/a" → length 2 → target at idx 1.
+    assertEquals(1,
+        INodeLockManager.computeMaxLockDepth(IIPAcquireMode.PATH_WRITE, 2));
+  }
+
+  @Test
+  @Timeout(10)
+  public void computeMaxLockDepthPathWriteOnRootIsInvalid() {
+    // "/" → length 1 → no valid target for PATH_WRITE.
+    assertEquals(INodeLockManager.INVALID_WRITE_DEPTH,
+        INodeLockManager.computeMaxLockDepth(IIPAcquireMode.PATH_WRITE, 1));
+  }
+
   // -------- Mode validation --------
 
   @Test
   @Timeout(10)
   public void deferredModeThrowsUnsupported() {
-    assertThrows(UnsupportedOperationException.class,
-        () -> mgr.acquire("/a", IIPAcquireMode.PATH_WRITE));
     assertThrows(UnsupportedOperationException.class,
         () -> mgr.acquire("/a", IIPAcquireMode.ANCESTOR_WRITE));
     assertThrows(UnsupportedOperationException.class,
@@ -358,7 +460,7 @@ public class TestINodeLockManager {
   @Timeout(10)
   public void unsupportedModeLeavesCompatLockUntouched() {
     assertThrows(UnsupportedOperationException.class,
-        () -> mgr.acquire("/a", IIPAcquireMode.PATH_WRITE));
+        () -> mgr.acquire("/a", IIPAcquireMode.ANCESTOR_WRITE));
     assertEquals(0, compat.getReadHoldCount(),
         "compat-read must not be acquired before mode validation");
     assertEquals(0, pool.size());

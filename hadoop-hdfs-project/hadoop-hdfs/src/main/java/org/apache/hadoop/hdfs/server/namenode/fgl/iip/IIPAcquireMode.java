@@ -49,7 +49,7 @@ import org.apache.hadoop.classification.InterfaceAudience;
  *   <tr><td>{@link #PARENT_WRITE}</td>
  *       <td>read (root → parent's parent)</td><td>parent: write; target: not locked (absent for create)</td><td>read</td><td>PILOT</td></tr>
  *   <tr><td>{@link #PATH_WRITE}</td>
- *       <td>read (root → leaf)</td><td>write</td><td>read</td><td>DEFERRED</td></tr>
+ *       <td>read (root → leaf)</td><td>write</td><td>read</td><td>PILOT</td></tr>
  *   <tr><td>{@link #ANCESTOR_WRITE}</td>
  *       <td>read (root → subtree root's parent)</td><td>subtree root: write; descendants: not locked</td><td>read</td><td>DEFERRED</td></tr>
  *   <tr><td>{@link #RENAME_WRITE}</td>
@@ -85,6 +85,20 @@ public enum IIPAcquireMode {
    */
   PARENT_WRITE(Impl.PILOT),
 
+  /**
+   * Write access to a single INode at the path target (e.g.,
+   * {@code setPermission}, {@code setOwner}, {@code setTimes},
+   * {@code setReplication}). Acquires read locks on every ancestor
+   * from root to parent, then a write lock on the target itself. The
+   * target must exist; this mode cannot be used to create a new INode
+   * (callers must use {@link #PARENT_WRITE} for that).
+   *
+   * <p>Required path length is 2 (the shortest path that has both an
+   * ancestor chain and a target — e.g., {@code /file}). Acquiring on
+   * the root {@code "/"} throws {@link org.apache.hadoop.fs.InvalidPathException}.
+   */
+  PATH_WRITE(Impl.PILOT),
+
   // ========= Fallback modes =========
 
   /**
@@ -105,14 +119,6 @@ public enum IIPAcquireMode {
   ADMIN_META(Impl.FALLBACK),
 
   // ========= Declared but deferred =========
-
-  /**
-   * Write access to a single INode at the path target (e.g.,
-   * {@code setPermission}, {@code setOwner}). Acquires read locks on all
-   * ancestors and a write lock on the target. Not implemented in the
-   * pilot — the first RPC to need this mode must implement it.
-   */
-  PATH_WRITE(Impl.DEFERRED),
 
   /**
    * Write access to a subtree root, for operations that affect all
