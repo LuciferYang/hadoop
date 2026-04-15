@@ -2790,25 +2790,112 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.GLOBAL);
+
+    // HDFS-17385 Phase II pilot: PATH_WRITE path with nested BM lock.
+    boolean pilotHandled = false;
+    if (canUsePilotPathWrite(src)) {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot set replication for " + src);
-        success = FSDirAttrOp.setReplication(dir, pc, blockManager, src,
-            replication);
-      } finally {
-        writeUnlock(RwLockMode.GLOBAL, operationName, getLockReportInfoSupplier(src));
+        Boolean pilotRet = setReplicationPilot(src, replication, pc);
+        if (pilotRet != null) {
+          success = pilotRet;
+          pilotHandled = true;
+        }
+      } catch (PilotEnvelopeMissException pem) {
+        // Envelope miss — fall through to legacy.
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
+    }
+
+    if (!pilotHandled) {
+      try {
+        writeLock(RwLockMode.GLOBAL);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot set replication for " + src);
+          success = FSDirAttrOp.setReplication(dir, pc, blockManager, src,
+              replication);
+        } finally {
+          writeUnlock(RwLockMode.GLOBAL, operationName, getLockReportInfoSupplier(src));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
+      }
     }
     if (success) {
       getEditLog().logSync();
       logAuditEvent(true, operationName, src);
     }
     return success;
+  }
+
+  /**
+   * FGL_IIP path for {@code setReplication}. First pilot RPC that
+   * combines PATH_WRITE on the target with a nested BM write lock
+   * (checklist rule 4: IIPLock > BMLock; acquired under IIP,
+   * released before IIP closes). Mirrors the BM read-lock pattern
+   * used by getBlockLocationsPilot but with the write variant.
+   *
+   * <p>Phase B envelope:
+   * <ul>
+   *   <li>target must exist, be a regular file (not dir / symlink);</li>
+   *   <li>striped-layout files are out of pilot scope (legacy also
+   *       returns null/false for striped — matched by the
+   *       {@code unprotectedSetReplication} null-return);</li>
+   *   <li>ancestors satisfy {@link #ancestorsAllowMutate}.</li>
+   * </ul>
+   *
+   * @return {@code true}/{@code false} matching legacy semantics;
+   *         {@code null} if the caller should fall back to legacy
+   *         (envelope miss under held locks)
+   * @throws PilotEnvelopeMissException on structural misses
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  private Boolean setReplicationPilot(String src, short replication,
+      FSPermissionChecker pc) throws IOException {
+    // bm.verifyReplication is called by the legacy path too; keep
+    // it outside the lock acquisition (legacy does the same — it's
+    // called before fsd.writeLock in FSDirAttrOp.setReplication).
+    blockManager.verifyReplication(src, replication, null);
+
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot set replication for " + src);
+
+      INodesInPath iip = lip.iip();
+      INode target = iip.getLastINode();
+      if (target == null) {
+        return null;  // fall back so legacy raises the right error
+      }
+      if (!target.isFile()) {
+        return null;  // directory/symlink — legacy returns false
+      }
+      if (target.asFile().isStriped()) {
+        return null;  // striped files out of pilot scope
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        return null;
+      }
+
+      // BM write lock acquired UNDER PATH_WRITE; released BEFORE
+      // PATH_WRITE closes. Satisfies assertions in BlockManager
+      // .setReplication path (hasWriteLock(BM)) and processExtra-
+      // Redundancy (hasWriteLock(GLOBAL) which is satisfied by
+      // HELD_IIP_WRITE via IIPBasedFSNamesystemLock.hasWriteLock).
+      writeLock(RwLockMode.BM);
+      try {
+        return FSDirAttrOp.setReplication(dir, pc, iip, replication);
+      } finally {
+        writeUnlock(RwLockMode.BM, "setReplication");
+      }
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException(
+          "setReplication interrupted on " + src);
+    }
   }
 
   /**

@@ -254,6 +254,40 @@ public class FSDirAttrOp {
     return isFile;
   }
 
+  /**
+   * FGL_IIP pilot overload. Caller has already acquired
+   * {@code PATH_WRITE} on {@code iip} and the BM write lock (nested
+   * under PATH_WRITE per checklist rule 4: IIPLock > BMLock).
+   * bm.verifyReplication must be called by the caller BEFORE
+   * acquiring PATH_WRITE — this matches the legacy shape which calls
+   * it outside the fsd.writeLock block.
+   *
+   * <p>Returns {@code false} (not-a-file or striped-file fall-back
+   * marker) when {@code unprotectedSetReplication} returns null.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  static boolean setReplication(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip,
+      final short replication) throws IOException {
+    final boolean isFile;
+    fsd.writeLock();
+    try {
+      if (fsd.isPermissionEnabled()) {
+        fsd.checkPathAccess(pc, iip, FsAction.WRITE);
+      }
+      final BlockInfo[] blocks = unprotectedSetReplication(fsd, iip,
+                                                           replication);
+      isFile = blocks != null;
+      if (isFile) {
+        fsd.getEditLog().logSetReplication(iip.getPath(), replication);
+      }
+    } finally {
+      fsd.writeUnlock();
+    }
+    return isFile;
+  }
+
   static FileStatus unsetStoragePolicy(FSDirectory fsd, FSPermissionChecker pc,
       BlockManager bm, String src) throws IOException {
     return setStoragePolicy(fsd, pc, bm, src,

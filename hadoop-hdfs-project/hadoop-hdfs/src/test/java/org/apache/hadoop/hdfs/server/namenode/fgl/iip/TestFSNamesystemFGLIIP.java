@@ -1969,6 +1969,156 @@ public class TestFSNamesystemFGLIIP {
           "unexpected final mtime for file " + t);
     }
   }
+
+  // ======================================================================
+  // setReplication pilot path (PATH_WRITE + nested BM write lock).
+  // ======================================================================
+
+  /** Happy path: lower replication from 3 (default) to 1. */
+  @Test
+  @Timeout(60)
+  public void setReplicationDecreases() throws Exception {
+    Path p = new Path("/sr-down");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 3, 4096L)) {
+      out.write(new byte[64]);
+    }
+    assertTrue(fs.setReplication(p, (short) 1));
+    assertEquals((short) 1, fs.getFileStatus(p).getReplication());
+  }
+
+  /** Raise replication. */
+  @Test
+  @Timeout(60)
+  public void setReplicationIncreases() throws Exception {
+    Path p = new Path("/sr-up");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1, 4096L)) {
+      out.write(new byte[64]);
+    }
+    assertTrue(fs.setReplication(p, (short) 2));
+    assertEquals((short) 2, fs.getFileStatus(p).getReplication());
+  }
+
+  /** setReplication on a directory returns false (legacy parity). */
+  @Test
+  @Timeout(60)
+  public void setReplicationOnDirectoryReturnsFalse() throws Exception {
+    Path dir = new Path("/sr-dir");
+    fs.mkdirs(dir);
+    assertFalse(fs.setReplication(dir, (short) 2));
+  }
+
+  /** Missing target returns false (legacy parity). */
+  @Test
+  @Timeout(60)
+  public void setReplicationOnMissingTargetReturnsFalse() throws Exception {
+    assertFalse(fs.setReplication(new Path("/sr-missing"), (short) 2));
+  }
+
+  /**
+   * Non-writer user is rejected. Verifies PATH_WRITE path enforces
+   * checkPathAccess(WRITE).
+   */
+  @Test
+  @Timeout(60)
+  public void setReplicationRespectsPathAccessWrite() throws Exception {
+    Path parent = new Path("/sr-perm");
+    fs.mkdirs(parent);
+    Path p = new Path(parent, "file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+    fs.setPermission(p, new FsPermission((short) 0644));
+
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser("sr-other-user");
+    final URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    other.doAs((PrivilegedExceptionAction<Void>) () -> {
+      DistributedFileSystem otherFs = (DistributedFileSystem)
+          FileSystem.get(clusterUri, otherConf);
+      try {
+        assertThrows(AccessControlException.class,
+            () -> otherFs.setReplication(p, (short) 2));
+      } finally {
+        otherFs.close();
+      }
+      return null;
+    });
+  }
+
+  /** /.snapshot paths fall back to legacy. */
+  @Test
+  @Timeout(60)
+  public void setReplicationSnapshotPathFallsBackToLegacy() throws Exception {
+    Path dir = new Path("/sr-snap-parent");
+    fs.mkdirs(dir);
+    fs.allowSnapshot(dir);
+    Path f = new Path(dir, "data");
+    try (FSDataOutputStream out = fs.create(f, true, 4096, (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+    fs.createSnapshot(dir, "s1");
+    Path snapFile = new Path(dir, ".snapshot/s1/data");
+    assertThrows(IOException.class,
+        () -> fs.setReplication(snapFile, (short) 2));
+  }
+
+  /** 16 threads setReplication on their own files in parallel. */
+  @Test
+  @Timeout(120)
+  public void parallelSetReplicationDisjointTargets() throws Exception {
+    final int numThreads = 16;
+    for (int t = 0; t < numThreads; t++) {
+      Path p = new Path("/sr-parallel/f" + t);
+      fs.mkdirs(p.getParent());
+      try (FSDataOutputStream out = fs.create(p, true, 4096,
+          (short) 1, 4096L)) {
+        out.write(new byte[4]);
+      }
+    }
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < 10; i++) {
+              short repl = (short) ((i % 2) + 1);
+              if (!fs.setReplication(new Path("/sr-parallel/f" + tid), repl)) {
+                errors.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
+    // Final replication per file: i=9 → (9 % 2)+1 = 2.
+    for (int t = 0; t < numThreads; t++) {
+      assertEquals((short) 2,
+          fs.getFileStatus(new Path("/sr-parallel/f" + t)).getReplication(),
+          "unexpected final replication for file " + t);
+    }
+  }
 }
 
 
