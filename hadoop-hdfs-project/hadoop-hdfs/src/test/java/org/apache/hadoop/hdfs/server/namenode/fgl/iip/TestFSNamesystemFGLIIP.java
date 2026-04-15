@@ -1650,5 +1650,176 @@ public class TestFSNamesystemFGLIIP {
     }
     assertEquals(0, errors.get());
   }
+
+  // ======================================================================
+  // setOwner pilot path (PATH_WRITE).
+  // ======================================================================
+
+  /**
+   * Superuser setOwner on a regular file. Non-root user is not
+   * allowed (legacy parity), so we run as the cluster superuser.
+   */
+  @Test
+  @Timeout(60)
+  public void setOwnerChangesOwnerAsSuperuser() throws Exception {
+    Path p = new Path("/so-su");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    fs.setOwner(p, "newuser", "newgroup");
+    FileStatus status = fs.getFileStatus(p);
+    assertEquals("newuser", status.getOwner());
+    assertEquals("newgroup", status.getGroup());
+  }
+
+  /** Changing only the group (keeping owner null) works. */
+  @Test
+  @Timeout(60)
+  public void setOwnerChangesGroupOnly() throws Exception {
+    Path p = new Path("/so-group-only");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    String origOwner = fs.getFileStatus(p).getOwner();
+    fs.setOwner(p, null, "only-new-group");
+    FileStatus status = fs.getFileStatus(p);
+    assertEquals(origOwner, status.getOwner(), "owner must not change");
+    assertEquals("only-new-group", status.getGroup());
+  }
+
+  /** Missing target → FileNotFoundException. */
+  @Test
+  @Timeout(60)
+  public void setOwnerOnMissingTargetFails() throws Exception {
+    assertThrows(FileNotFoundException.class,
+        () -> fs.setOwner(new Path("/so-missing"), "u", "g"));
+  }
+
+  /**
+   * Non-superuser cannot change owner to a different user. Must
+   * throw AccessControlException.
+   */
+  @Test
+  @Timeout(60)
+  public void setOwnerRejectsNonSuperuserChangingOwnerToDifferentUser()
+      throws Exception {
+    Path parent = new Path("/so-perm");
+    fs.mkdirs(parent);
+    Path p = new Path(parent, "file");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    // Make the file owned by a non-superuser so they can attempt
+    // (and be rejected on) setOwner.
+    fs.setOwner(p, "so-other-user", "so-other-group");
+    fs.setPermission(parent, new FsPermission((short) 0777));
+
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser("so-other-user");
+    final URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    other.doAs((PrivilegedExceptionAction<Void>) () -> {
+      DistributedFileSystem otherFs = (DistributedFileSystem)
+          FileSystem.get(clusterUri, otherConf);
+      try {
+        // Non-su user trying to change owner to a different user.
+        assertThrows(AccessControlException.class,
+            () -> otherFs.setOwner(p, "yet-another-user", null));
+      } finally {
+        otherFs.close();
+      }
+      return null;
+    });
+  }
+
+  /** /.snapshot paths fall back to legacy which rejects them. */
+  @Test
+  @Timeout(60)
+  public void setOwnerSnapshotPathFallsBackToLegacy() throws Exception {
+    Path dir = new Path("/so-snap-parent");
+    fs.mkdirs(dir);
+    fs.allowSnapshot(dir);
+    Path f = new Path(dir, "data");
+    try (FSDataOutputStream out = fs.create(f)) {
+      out.write(new byte[8]);
+    }
+    fs.createSnapshot(dir, "s1");
+    Path snapFile = new Path(dir, ".snapshot/s1/data");
+    assertThrows(IOException.class,
+        () -> fs.setOwner(snapFile, "x", "y"));
+  }
+
+  /** /.reserved paths fall back and apply through the real INode. */
+  @Test
+  @Timeout(60)
+  public void setOwnerReservedPathFallsBackToLegacy() throws Exception {
+    Path p = new Path("/so-reserved");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    long fileId = fs.getClient().getFileInfo(p.toString()).getFileId();
+    String reserved = "/.reserved/.inodes/" + fileId;
+    fs.setOwner(new Path(reserved), "via-reserved", "via-reserved-group");
+    FileStatus status = fs.getFileStatus(p);
+    assertEquals("via-reserved", status.getOwner());
+    assertEquals("via-reserved-group", status.getGroup());
+  }
+
+  /** 16 threads setOwner on their own distinct files in parallel. */
+  @Test
+  @Timeout(120)
+  public void parallelSetOwnerDisjointTargets() throws Exception {
+    final int numThreads = 16;
+    for (int t = 0; t < numThreads; t++) {
+      Path p = new Path("/so-parallel/f" + t);
+      fs.mkdirs(p.getParent());
+      try (FSDataOutputStream out = fs.create(p)) {
+        out.write(new byte[4]);
+      }
+    }
+
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < 20; i++) {
+              String u = "user-" + tid + "-" + (i % 2);
+              fs.setOwner(new Path("/so-parallel/f" + tid), u, null);
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
+    // Final owner for each file must be user-<tid>-1 (last iteration
+    // index 19 → i%2 == 1).
+    for (int t = 0; t < numThreads; t++) {
+      assertEquals("user-" + t + "-1",
+          fs.getFileStatus(new Path("/so-parallel/f" + t)).getOwner(),
+          "unexpected final owner for file " + t);
+    }
+  }
 }
+
 

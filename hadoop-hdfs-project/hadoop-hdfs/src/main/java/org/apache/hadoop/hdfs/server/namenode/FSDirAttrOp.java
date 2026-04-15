@@ -143,6 +143,47 @@ public class FSDirAttrOp {
     return fsd.getAuditFileInfo(iip);
   }
 
+  /**
+   * FGL_IIP pilot overload. Caller has already acquired
+   * {@code PATH_WRITE} on {@code iip} and verified the envelope.
+   * Preserves the non-superuser username / group-membership checks
+   * from the legacy path.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  static FileStatus setOwner(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip,
+      String username, String group) throws IOException {
+    boolean changed;
+    fsd.writeLock();
+    try {
+      fsd.checkOwner(pc, iip);
+      // Non-superuser constraints (mirrors legacy path).
+      if ((username != null && !pc.getUser().equals(username)) ||
+          (group != null && !pc.isMemberOfGroup(group))) {
+        try {
+          pc.checkSuperuserPrivilege(iip.getPath());
+        } catch (AccessControlException e) {
+          if (username != null && !pc.getUser().equals(username)) {
+            throw new AccessControlException("User " + pc.getUser()
+                + " is not a super user (non-super user cannot change owner).");
+          }
+          if (group != null && !pc.isMemberOfGroup(group)) {
+            throw new AccessControlException(
+                "User " + pc.getUser() + " does not belong to " + group);
+          }
+        }
+      }
+      changed = unprotectedSetOwner(fsd, iip, username, group);
+    } finally {
+      fsd.writeUnlock();
+    }
+    if (changed) {
+      fsd.getEditLog().logSetOwner(iip.getPath(), username, group);
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
   static FileStatus setTimes(
       FSDirectory fsd, FSPermissionChecker pc, String src, long mtime,
       long atime) throws IOException {

@@ -2329,22 +2329,74 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+
+    // HDFS-17385 Phase II pilot: PATH_WRITE path.
+    boolean pilotHandled = false;
+    if (canUsePilotPathWrite(src)) {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot set owner for " + src);
-        auditStat = FSDirAttrOp.setOwner(dir, pc, src, username, group);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        auditStat = setOwnerPilot(src, username, group, pc);
+        if (auditStat != null) {
+          pilotHandled = true;
+        }
+      } catch (PilotEnvelopeMissException pem) {
+        // Envelope miss — fall through to legacy.
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
+    }
+
+    if (!pilotHandled) {
+      try {
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot set owner for " + src);
+          auditStat = FSDirAttrOp.setOwner(dir, pc, src, username, group);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
+      }
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
+  }
+
+  /**
+   * FGL_IIP path for {@code setOwner}. Acquires {@code PATH_WRITE}
+   * and invokes the pre-resolved-IIP overload of
+   * {@link FSDirAttrOp#setOwner}. Phase-B envelope mirrors
+   * setPermission (target must exist, ancestors must satisfy
+   * {@link #ancestorsAllowMutate}).
+   *
+   * @throws PilotEnvelopeMissException on structural misses
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  private FileStatus setOwnerPilot(String src, String username, String group,
+      FSPermissionChecker pc) throws IOException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot set owner for " + src);
+
+      INodesInPath iip = lip.iip();
+      if (iip.getLastINode() == null) {
+        return null;
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        return null;
+      }
+
+      return FSDirAttrOp.setOwner(dir, pc, iip, username, group);
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException(
+          "setOwner interrupted on " + src);
+    }
   }
 
   /**
