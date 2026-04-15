@@ -2119,6 +2119,225 @@ public class TestFSNamesystemFGLIIP {
           "unexpected final replication for file " + t);
     }
   }
+
+  // ======================================================================
+  // getListing pilot path (PATH_READ with directory iteration).
+  // ======================================================================
+
+  /** Happy path: list a directory with a handful of children. */
+  @Test
+  @Timeout(60)
+  public void getListingOnDirectory() throws Exception {
+    Path dir = new Path("/gl-dir");
+    fs.mkdirs(dir);
+    for (int i = 0; i < 5; i++) {
+      try (FSDataOutputStream out = fs.create(new Path(dir, "f" + i))) {
+        out.write(new byte[4]);
+      }
+    }
+    FileStatus[] entries = fs.listStatus(dir);
+    assertEquals(5, entries.length);
+  }
+
+  /** Listing a single file returns a one-entry listing of itself. */
+  @Test
+  @Timeout(60)
+  public void getListingOnFile() throws Exception {
+    Path p = new Path("/gl-single");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    FileStatus[] entries = fs.listStatus(p);
+    assertEquals(1, entries.length);
+    assertEquals("gl-single", entries[0].getPath().getName());
+  }
+
+  /** Listing a missing path throws FileNotFoundException. */
+  @Test
+  @Timeout(60)
+  public void getListingOnMissingPathFails() throws Exception {
+    assertThrows(FileNotFoundException.class,
+        () -> fs.listStatus(new Path("/gl-missing")));
+  }
+
+  /** Empty directory → zero-length listing. */
+  @Test
+  @Timeout(60)
+  public void getListingOnEmptyDirectory() throws Exception {
+    Path dir = new Path("/gl-empty");
+    fs.mkdirs(dir);
+    FileStatus[] entries = fs.listStatus(dir);
+    assertEquals(0, entries.length);
+  }
+
+  /**
+   * Pagination via {@code listStatusIterator} which uses startAfter.
+   * Verifies multiple listing batches assemble correctly under
+   * PATH_READ.
+   */
+  @Test
+  @Timeout(60)
+  public void getListingPaginationAcrossBatches() throws Exception {
+    Path dir = new Path("/gl-pagination");
+    fs.mkdirs(dir);
+    final int total = 50;
+    for (int i = 0; i < total; i++) {
+      try (FSDataOutputStream out = fs.create(
+          new Path(dir, String.format("f%03d", i)))) {
+        out.write(new byte[4]);
+      }
+    }
+    org.apache.hadoop.fs.RemoteIterator<FileStatus> it =
+        fs.listStatusIterator(dir);
+    int count = 0;
+    while (it.hasNext()) {
+      it.next();
+      count++;
+    }
+    assertEquals(total, count);
+  }
+
+  /**
+   * listStatus with needLocation=true exercises per-child block-
+   * location resolution — each createFileStatus call acquires BM
+   * read lock nested.
+   */
+  @Test
+  @Timeout(60)
+  public void getListingWithBlockLocations() throws Exception {
+    Path dir = new Path("/gl-loc");
+    fs.mkdirs(dir);
+    for (int i = 0; i < 3; i++) {
+      try (FSDataOutputStream out = fs.create(new Path(dir, "f" + i))) {
+        out.write(new byte[256]);
+      }
+    }
+    // LocatedFileStatus iteration forces needLocation=true server-side.
+    org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus>
+        it = fs.listLocatedStatus(dir);
+    int count = 0;
+    while (it.hasNext()) {
+      org.apache.hadoop.fs.LocatedFileStatus status = it.next();
+      if (!status.isDirectory()) {
+        org.apache.hadoop.fs.BlockLocation[] bl = status.getBlockLocations();
+        assertNotNull(bl);
+        assertTrue(bl.length > 0,
+            "file listing must include block locations");
+      }
+      count++;
+    }
+    assertEquals(3, count);
+  }
+
+  /** /.snapshot paths fall back to legacy which handles them. */
+  @Test
+  @Timeout(60)
+  public void getListingSnapshotPathFallsBackToLegacy() throws Exception {
+    Path dir = new Path("/gl-snap-parent");
+    fs.mkdirs(dir);
+    fs.allowSnapshot(dir);
+    try (FSDataOutputStream out = fs.create(new Path(dir, "inside"))) {
+      out.write(new byte[16]);
+    }
+    fs.createSnapshot(dir, "s1");
+    FileStatus[] entries = fs.listStatus(
+        new Path(dir, ".snapshot/s1"));
+    assertEquals(1, entries.length);
+    assertEquals("inside", entries[0].getPath().getName());
+  }
+
+  /** /.reserved paths fall back to legacy. */
+  @Test
+  @Timeout(60)
+  public void getListingReservedPathFallsBackToLegacy() throws Exception {
+    // listStatus on /.reserved returns the well-known set of reserved
+    // names (".inodes", "raw"). Legacy handles this via
+    // getReservedListing; pilot envelope rejects /.reserved so the
+    // call routes through legacy.
+    FileStatus[] entries = fs.listStatus(new Path("/.reserved"));
+    assertTrue(entries.length >= 1, "reserved listing must return >=1 entry");
+  }
+
+  /** Non-owner lacking READ_EXECUTE on the directory is rejected. */
+  @Test
+  @Timeout(60)
+  public void getListingRespectsReadExecutePermission() throws Exception {
+    Path dir = new Path("/gl-perm/restricted");
+    fs.mkdirs(dir);
+    try (FSDataOutputStream out = fs.create(new Path(dir, "inside"))) {
+      out.write(new byte[8]);
+    }
+    fs.setPermission(dir, new FsPermission((short) 0700));
+
+    final UserGroupInformation other =
+        UserGroupInformation.createRemoteUser("gl-other-user");
+    final URI clusterUri = cluster.getURI();
+    final Configuration otherConf = new HdfsConfiguration();
+    otherConf.setClass(DFSConfigKeys.DFS_NAMENODE_LOCK_MODEL_PROVIDER_KEY,
+        IIPBasedFSNamesystemLock.class, FSNLockManager.class);
+
+    other.doAs((PrivilegedExceptionAction<Void>) () -> {
+      DistributedFileSystem otherFs = (DistributedFileSystem)
+          FileSystem.get(clusterUri, otherConf);
+      try {
+        assertThrows(AccessControlException.class,
+            () -> otherFs.listStatus(dir));
+      } finally {
+        otherFs.close();
+      }
+      return null;
+    });
+  }
+
+  /** Concurrent readers listing disjoint directories in parallel. */
+  @Test
+  @Timeout(120)
+  public void parallelGetListingDisjointDirectories() throws Exception {
+    final int numThreads = 16;
+    for (int t = 0; t < numThreads; t++) {
+      Path d = new Path("/gl-parallel/d" + t);
+      fs.mkdirs(d);
+      for (int i = 0; i < 5; i++) {
+        try (FSDataOutputStream out = fs.create(new Path(d, "f" + i))) {
+          out.write(new byte[4]);
+        }
+      }
+    }
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < 30; i++) {
+              FileStatus[] entries = fs.listStatus(
+                  new Path("/gl-parallel/d" + tid));
+              if (entries.length != 5) {
+                errors.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
+  }
 }
 
 

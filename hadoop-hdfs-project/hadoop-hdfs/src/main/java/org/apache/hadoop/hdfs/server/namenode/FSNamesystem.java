@@ -5279,24 +5279,43 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @throws IOException if other I/O error occurred
    */
   DirectoryListing getListing(String src, byte[] startAfter,
-      boolean needLocation) 
+      boolean needLocation)
       throws IOException {
     checkOperation(OperationCategory.READ);
     final String operationName = "listStatus";
     DirectoryListing dl = null;
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      readLock(RwLockMode.FS);
+
+    // HDFS-17385 Phase II pilot: PATH_READ path. Fourth read-class
+    // pilot RPC; adds directory iteration / pagination concerns on
+    // top of the existing point-read RPCs.
+    boolean pilotHandled = false;
+    if (canUsePilotGetListing(src, startAfter)) {
       try {
-        checkOperation(NameNode.OperationCategory.READ);
-        dl = getListingInt(dir, pc, src, startAfter, needLocation);
-      } finally {
-        readUnlock(RwLockMode.FS, operationName, getLockReportInfoSupplier(src));
+        dl = getListingPilot(src, startAfter, needLocation, pc);
+        pilotHandled = true;
+      } catch (PilotEnvelopeMissException pem) {
+        // Envelope miss — fall through to legacy.
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
+    }
+
+    if (!pilotHandled) {
+      try {
+        readLock(RwLockMode.FS);
+        try {
+          checkOperation(NameNode.OperationCategory.READ);
+          dl = getListingInt(dir, pc, src, startAfter, needLocation);
+        } finally {
+          readUnlock(RwLockMode.FS, operationName, getLockReportInfoSupplier(src));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
+      }
     }
     if (dl != null && needLocation && isObserver()) {
       for (HdfsFileStatus fs : dl.getPartialListing()) {
@@ -5308,6 +5327,72 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     }
     logAuditEvent(true, operationName, src);
     return dl;
+  }
+
+  /**
+   * Envelope-A (lock-free) check for the FGL_IIP {@code getListing}
+   * pilot path. Extends {@link #canUsePilotPathRead} with
+   * listing-specific rejections: INodePath-style startAfter (begins
+   * with '/') requires resolveComponents which the pilot envelope
+   * does not handle.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
+   */
+  private boolean canUsePilotGetListing(String src, byte[] startAfter) {
+    if (!canUsePilotPathRead(src)) {
+      return false;
+    }
+    // INodePath-style startAfter ("/.reserved/.inodes/<id>/<name>")
+    // requires FSDirectory.resolveComponents — legacy handles it
+    // (lines 62-75 of getListingInt). Pilot rejects and lets legacy
+    // handle.
+    if (startAfter != null && startAfter.length > 0
+        && startAfter[0] == org.apache.hadoop.fs.Path.SEPARATOR_CHAR) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * FGL_IIP path for {@code getListing}. Acquires {@code PATH_READ}
+   * on the target (read locks on ancestors + read on target) and
+   * invokes the pre-resolved-IIP overload of
+   * {@link FSDirStatAndListingOp#getListingForPilot}. Directory
+   * iteration happens under the target's read lock; child INodes
+   * are not individually locked — their metadata is read with
+   * whatever consistency the JMM provides for primitive and
+   * packed-long fields, matching the legacy release-lock-then-read
+   * behaviour that clients already expect.
+   *
+   * <p>A {@code null} return is a legitimate result (target not
+   * found) and is returned to the caller as-is; envelope misses
+   * discovered under held locks are signalled via
+   * {@link PilotEnvelopeMissException}.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
+   */
+  private DirectoryListing getListingPilot(String src, byte[] startAfter,
+      boolean needLocation, FSPermissionChecker pc) throws IOException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_READ)) {
+      checkOperation(OperationCategory.READ);
+      // Traversal permission check — mirrors the behaviour that
+      // legacy fsd.resolvePath(pc, src, DirOp.READ) would run.
+      try {
+        dir.checkTraverse(pc, lip.iip(), DirOp.READ);
+      } catch (org.apache.hadoop.fs.ParentNotDirectoryException pnde) {
+        if (pc.isSuperUser()) {
+          throw pnde;
+        }
+        throw new AccessControlException(pnde.getMessage());
+      }
+      return FSDirStatAndListingOp.getListingForPilot(
+          dir, pc, lip.iip(), startAfter, needLocation);
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException(
+          "getListing interrupted on " + src);
+    }
   }
 
   public byte[] getSrcPathsHash(String[] srcs) {

@@ -83,6 +83,27 @@ class FSDirStatAndListingOp {
   }
 
   /**
+   * FGL_IIP pilot overload of {@code getListingInt}. Caller has
+   * already acquired {@code PATH_READ} on the target and verified
+   * the envelope (non-reserved, non-snapshot, non-INodePath-style
+   * startAfter). Skips {@code resolvePath} and the
+   * reserved-startAfter resolution; preserves the directory-only
+   * permission check.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
+   */
+  static DirectoryListing getListingForPilot(FSDirectory fsd,
+      FSPermissionChecker pc, INodesInPath iip, byte[] startAfter,
+      boolean needLocation) throws IOException {
+    if (fsd.isPermissionEnabled()
+        && iip.getLastINode() != null
+        && iip.getLastINode().isDirectory()) {
+      fsd.checkPathAccess(pc, iip, FsAction.READ_EXECUTE);
+    }
+    return getListing(fsd, iip, startAfter, needLocation);
+  }
+
+  /**
    * Get the file info for a specific file.
    * @param fsd The FS directory
    * @param pc The permission checker
