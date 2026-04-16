@@ -51,7 +51,7 @@ import org.apache.hadoop.classification.InterfaceAudience;
  *   <tr><td>{@link #PATH_WRITE}</td>
  *       <td>read (root → leaf)</td><td>write</td><td>read</td><td>PILOT</td></tr>
  *   <tr><td>{@link #ANCESTOR_WRITE}</td>
- *       <td>read (root → subtree root's parent)</td><td>subtree root: write; descendants: not locked</td><td>read</td><td>DEFERRED</td></tr>
+ *       <td>read (root → subtree root's parent)</td><td>subtree root: write; descendants: not locked</td><td>read</td><td>PILOT</td></tr>
  *   <tr><td>{@link #RENAME_WRITE}</td>
  *       <td>read on both paths</td><td>both parents: write in ascending-INode-ID order</td><td>read</td><td>DEFERRED</td></tr>
  *   <tr><td>{@link #GLOBAL_READ}</td>
@@ -118,17 +118,20 @@ public enum IIPAcquireMode {
    */
   ADMIN_META(Impl.FALLBACK),
 
-  // ========= Declared but deferred =========
-
   /**
    * Write access to a subtree root, for operations that affect all
    * descendants (e.g., {@code delete -r}, {@code chown -R},
    * {@code setQuota} on a subtree). Acquires read locks on ancestors of
    * the subtree root and a write lock on the subtree root itself;
    * descendants are iterated without per-INode locks, under the
-   * protection of the subtree root's write lock.
+   * protection of the subtree root's write lock. The lock plan is
+   * identical to {@link #PATH_WRITE} (read ancestors, write target);
+   * the distinct mode exists so RPC call sites can express intent
+   * and future lock-plan divergences don't require API migration.
    */
-  ANCESTOR_WRITE(Impl.DEFERRED),
+  ANCESTOR_WRITE(Impl.PILOT),
+
+  // ========= Declared but deferred =========
 
   /**
    * Write access to two parents for a rename operation. Acquires the two

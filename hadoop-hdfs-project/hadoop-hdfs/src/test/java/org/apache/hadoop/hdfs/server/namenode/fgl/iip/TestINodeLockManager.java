@@ -380,8 +380,6 @@ public class TestINodeLockManager {
   @Timeout(10)
   public void deferredModeThrowsUnsupported() {
     assertThrows(UnsupportedOperationException.class,
-        () -> mgr.acquire("/a", IIPAcquireMode.ANCESTOR_WRITE));
-    assertThrows(UnsupportedOperationException.class,
         () -> mgr.acquire("/a", IIPAcquireMode.RENAME_WRITE));
   }
 
@@ -460,7 +458,7 @@ public class TestINodeLockManager {
   @Timeout(10)
   public void unsupportedModeLeavesCompatLockUntouched() {
     assertThrows(UnsupportedOperationException.class,
-        () -> mgr.acquire("/a", IIPAcquireMode.ANCESTOR_WRITE));
+        () -> mgr.acquire("/a", IIPAcquireMode.RENAME_WRITE));
     assertEquals(0, compat.getReadHoldCount(),
         "compat-read must not be acquired before mode validation");
     assertEquals(0, pool.size());

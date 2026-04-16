@@ -417,9 +417,12 @@ public final class INodeLockManager {
       // Lock every level from root to target (read on all).
       return pathLen - 1;
     case PATH_WRITE:
+    case ANCESTOR_WRITE:
       // Lock every level from root to target; target gets write, all
       // ancestors get read. Requires at least 2 components — the mode
-      // is meaningless on the root INode.
+      // is meaningless on the root INode. PATH_WRITE and ANCESTOR_WRITE
+      // share the same lock plan; distinct modes express intent
+      // (single-node mutation vs subtree operation).
       if (pathLen < 2) {
         return INVALID_WRITE_DEPTH;
       }
@@ -432,8 +435,8 @@ public final class INodeLockManager {
       }
       return pathLen - 2;
     default:
-      // ANCESTOR_WRITE, RENAME_WRITE, GLOBAL_READ, ADMIN_META — not
-      // reachable because acquire() pre-checks isPilot().
+      // RENAME_WRITE, GLOBAL_READ, ADMIN_META — not reachable
+      // because acquire() pre-checks isPilot().
       throw new IllegalStateException(
           "computeMaxLockDepth called with non-pilot mode: " + mode);
     }

@@ -4110,15 +4110,25 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     FSPermissionChecker.setOperationType(operationName);
     boolean ret = false;
 
-    // HDFS-17385 Phase II pilot: FGL_IIP PARENT_WRITE path for
-    // single-file deletes. Uses a side-channel `holder` for the
-    // BlocksMapUpdateInfo because deletePilot returns Boolean and
-    // the out-of-band blocks map is assigned only on success.
+    // HDFS-17385 Phase II pilot: try FGL_IIP paths. Two modes:
+    //   1. PARENT_WRITE for single-file deletes (existing)
+    //   2. ANCESTOR_WRITE for recursive directory deletes (new)
+    // If the first misses (target is a directory), try the second
+    // when recursive=true. Both use a side-channel `holder` for
+    // the BlocksMapUpdateInfo.
     final BlocksMapUpdateInfo[] holder = new BlocksMapUpdateInfo[1];
     PilotResult<Boolean> pr = tryPilot(
         () -> canUsePilotDelete(src),
         () -> deletePilot(src, logRetryCache, holder, pc),
         operationName, src);
+    if (!pr.handled && recursive) {
+      // Single-file pilot missed — try recursive directory path.
+      pr = tryPilot(
+          () -> canUsePilotDelete(src),
+          () -> deleteRecursivePilot(src, recursive, logRetryCache,
+              holder, pc),
+          operationName, src);
+    }
     if (pr.handled) {
       ret = pr.value;
       toRemovedBlocks = holder[0];
@@ -4224,6 +4234,72 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       // Permission check mirrors legacy FSDirDeleteOp.delete:
       // parentAccess=WRITE, subAccess=ALL, ignoreEmptyDir=true. For a
       // regular file target, subAccess is moot (no children to recurse).
+      if (dir.isPermissionEnabled()) {
+        dir.checkPermission(pc, iip, false, null,
+            FsAction.WRITE, null, FsAction.ALL, true);
+      }
+
+      holder[0] = FSDirDeleteOp.deleteInternal(this, iip, logRetryCache);
+      return holder[0] != null;
+    }
+  }
+
+  /**
+   * FGL_IIP pilot for recursive directory delete. Uses
+   * {@code ANCESTOR_WRITE} — write-locks the subtree root (the
+   * directory being deleted); all descendants are unlinked under
+   * the protection of the root's write lock. Concurrent readers of
+   * descendants are serialized because they need a read lock on the
+   * subtree root as an ancestor.
+   *
+   * <p>This pilot supplements the existing
+   * {@link #deletePilot(String, boolean, BlocksMapUpdateInfo[],
+   *     FSPermissionChecker)} which handles single-file deletes via
+   * {@code PARENT_WRITE}. The outer {@code delete} method tries the
+   * single-file path first; if it misses (target is a directory) and
+   * {@code recursive=true}, this method is tried.
+   *
+   * @throws PilotEnvelopeMissException on Phase-B misses
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  private Boolean deleteRecursivePilot(String src, boolean recursive,
+      boolean logRetryCache, BlocksMapUpdateInfo[] holder,
+      FSPermissionChecker pc) throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src,
+        IIPAcquireMode.ANCESTOR_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot delete " + src);
+
+      INodesInPath iip = lip.iip();
+      INode target = iip.getLastINode();
+      if (target == null) {
+        return Boolean.FALSE;
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        throw new PilotEnvelopeMissException(
+            "delete -r: ancestor has snapshot/quota/storage-policy " + src);
+      }
+      // Target snapshot check (the target directory itself may be
+      // a snapshot root or have the WithSnapshot feature).
+      if (target.isDirectory()) {
+        INodeDirectory td = target.asDirectory();
+        if (td.isSnapshottable() || td.isWithSnapshot()) {
+          throw new PilotEnvelopeMissException(
+              "delete -r: target directory has snapshot feature " + src);
+        }
+      }
+
+      // Legacy FSDirDeleteOp.delete checks for non-empty + !recursive
+      // and throws PathIsNotEmptyDirectoryException. Pilot only enters
+      // this method when recursive=true, so that check is not needed.
+      // DFSUtil.checkProtectedDescendants is needed for recursive
+      // non-empty dirs.
+      if (dir.isNonEmptyDirectory(iip) && recursive) {
+        DFSUtil.checkProtectedDescendants(dir, iip);
+      }
+
+      // Permission: parentAccess=WRITE, subAccess=ALL.
       if (dir.isPermissionEnabled()) {
         dir.checkPermission(pc, iip, false, null,
             FsAction.WRITE, null, FsAction.ALL, true);

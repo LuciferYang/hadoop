@@ -3063,6 +3063,104 @@ public class TestFSNamesystemFGLIIP {
     }
     assertEquals(60, fs.getFileStatus(p).getLen());
   }
+
+  // ======================================================================
+  // delete -r pilot (ANCESTOR_WRITE).
+  // ======================================================================
+
+  /** Recursive delete of a non-empty directory tree. */
+  @Test
+  @Timeout(60)
+  public void deleteRecursiveNonEmptyDirectory() throws Exception {
+    Path dir = new Path("/delr-nonempty");
+    fs.mkdirs(new Path(dir, "sub1/sub2"));
+    try (FSDataOutputStream out = fs.create(
+        new Path(dir, "sub1/sub2/file"))) {
+      out.write(new byte[8]);
+    }
+    try (FSDataOutputStream out = fs.create(
+        new Path(dir, "sub1/file2"))) {
+      out.write(new byte[4]);
+    }
+    assertTrue(fs.delete(dir, true));
+    assertFalse(fs.exists(dir));
+  }
+
+  /** Recursive delete of a deeply nested tree. */
+  @Test
+  @Timeout(60)
+  public void deleteRecursiveDeeplyNested() throws Exception {
+    Path base = new Path("/delr-deep");
+    Path leaf = new Path(base, "a/b/c/d/e");
+    fs.mkdirs(leaf);
+    try (FSDataOutputStream out = fs.create(new Path(leaf, "file"))) {
+      out.write(new byte[4]);
+    }
+    assertTrue(fs.delete(base, true));
+    assertFalse(fs.exists(base));
+  }
+
+  /** Recursive delete on a single file still works. */
+  @Test
+  @Timeout(60)
+  public void deleteRecursiveOnFileFallsToSingleFilePath() throws Exception {
+    Path p = new Path("/delr-file");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[8]);
+    }
+    assertTrue(fs.delete(p, true));
+    assertFalse(fs.exists(p));
+  }
+
+  /** Concurrent recursive deletes on disjoint trees. */
+  @Test
+  @Timeout(120)
+  public void parallelRecursiveDeleteDisjointTrees() throws Exception {
+    final int numThreads = 8;
+    for (int t = 0; t < numThreads; t++) {
+      Path d = new Path("/pdelr/t" + t);
+      fs.mkdirs(d);
+      for (int i = 0; i < 5; i++) {
+        try (FSDataOutputStream out = fs.create(
+            new Path(d, "f" + i))) {
+          out.write(new byte[4]);
+        }
+      }
+    }
+    final AtomicInteger failures = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            if (!fs.delete(new Path("/pdelr/t" + tid), true)) {
+              failures.incrementAndGet();
+            }
+          } catch (Exception e) {
+            failures.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, failures.get());
+    for (int t = 0; t < numThreads; t++) {
+      assertFalse(fs.exists(new Path("/pdelr/t" + t)));
+    }
+  }
 }
 
 

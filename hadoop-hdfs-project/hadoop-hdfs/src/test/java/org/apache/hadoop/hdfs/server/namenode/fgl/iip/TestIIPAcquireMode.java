@@ -43,7 +43,8 @@ public class TestIIPAcquireMode {
   private static final Set<IIPAcquireMode> PILOT_MODES =
       EnumSet.of(IIPAcquireMode.PATH_READ,
           IIPAcquireMode.PARENT_WRITE,
-          IIPAcquireMode.PATH_WRITE);
+          IIPAcquireMode.PATH_WRITE,
+          IIPAcquireMode.ANCESTOR_WRITE);
 
   /** Expected fallback modes. Change with intent. */
   private static final Set<IIPAcquireMode> FALLBACK_MODES =
@@ -51,8 +52,7 @@ public class TestIIPAcquireMode {
 
   /** Expected deferred modes. Change with intent. */
   private static final Set<IIPAcquireMode> DEFERRED_MODES =
-      EnumSet.of(IIPAcquireMode.ANCESTOR_WRITE,
-          IIPAcquireMode.RENAME_WRITE);
+      EnumSet.of(IIPAcquireMode.RENAME_WRITE);
 
   /** Modes that take some per-INode write lock. */
   private static final Set<IIPAcquireMode> IIP_WRITE_MODES =
@@ -153,26 +153,22 @@ public class TestIIPAcquireMode {
   }
 
   @Test
-  public void pilotExercisesTwoWriteModes() {
+  public void pilotExercisesThreeWriteModes() {
     // Pilot modes: PATH_READ (no write) + PARENT_WRITE (parent write)
-    // + PATH_WRITE (target write). The pilot exercises two write
-    // patterns. If a future change adds a third pilot write mode,
-    // this test will fail and force the author to update the spec.
+    // + PATH_WRITE (target write) + ANCESTOR_WRITE (subtree root
+    // write). The pilot exercises three write patterns.
     long pilotWrites = PILOT_MODES.stream()
         .filter(IIPAcquireMode::needsIIPWrite)
         .count();
-    assertEquals(2, pilotWrites,
-        "pilot exercises exactly two IIP write patterns "
-            + "(PARENT_WRITE, PATH_WRITE)");
+    assertEquals(3, pilotWrites,
+        "pilot exercises exactly three IIP write patterns "
+            + "(PARENT_WRITE, PATH_WRITE, ANCESTOR_WRITE)");
   }
 
   @Test
   public void deferredModeSetMatchesSpec() {
-    // ANCESTOR_WRITE, RENAME_WRITE are declared but not implemented.
-    // Adding to or removing from this set is a taxonomy change that
-    // requires a spec update.
-    assertEquals(EnumSet.of(IIPAcquireMode.ANCESTOR_WRITE,
-            IIPAcquireMode.RENAME_WRITE),
+    // RENAME_WRITE is the only remaining deferred mode.
+    assertEquals(EnumSet.of(IIPAcquireMode.RENAME_WRITE),
         EnumSet.allOf(IIPAcquireMode.class).stream()
             .filter(IIPAcquireMode::isDeferred)
             .collect(java.util.stream.Collectors.toCollection(
