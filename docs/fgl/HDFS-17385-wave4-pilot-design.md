@@ -77,9 +77,9 @@ No code in `FSNamesystem` or RPC handlers branches on `dfs.namenode.lockmode`. D
 | Mode | Lock grid | Pilot? |
 |---|---|---|
 | `GLOBAL_READ` | compat-read | fallback only |
-| `PATH_READ` | ancestors read (root→leaf), target read | **yes** (`getFileInfo`, `getBlockLocations`, `isFileClosed`, `getListing`) |
-| `PATH_WRITE` | ancestors read (root→parent), target write | **yes** (`setPermission`, `setOwner`, `setTimes`, `setReplication`, `setStoragePolicy`) |
-| `PARENT_WRITE` | ancestors read (root→parent's parent), parent write; new child created under parent's lock | **yes** (`create`, `mkdirs`, `delete` single-file) |
+| `PATH_READ` | ancestors read (root→leaf), target read | **yes** — `getFileInfo`, `getBlockLocations`, `isFileClosed`, `getListing`, `getXAttrs`, `listXAttrs`, `getStoragePolicy`, `getPreferredBlockSize`, `getAclStatus`, `getErasureCodingPolicy`, `checkAccess` |
+| `PATH_WRITE` | ancestors read (root→parent), target write | **yes** — `setPermission`, `setOwner`, `setTimes`, `setReplication`, `setStoragePolicy`, `unsetStoragePolicy`, `setAcl`, `modifyAclEntries`, `removeAclEntries`, `removeDefaultAcl`, `removeAcl`, `setXAttr`, `removeXAttr`, `setErasureCodingPolicy`, `unsetErasureCodingPolicy` |
+| `PARENT_WRITE` | ancestors read (root→parent's parent), parent write; new child created under parent's lock | **yes** — `create`, `mkdirs`, `delete` (single-file) |
 | `ANCESTOR_WRITE` | ancestors read (root→target ancestor), subtree root write; descendants iterated without per-INode locks | deferred |
 | `RENAME_WRITE` | two paths; src-parent and dst-parent acquired in ascending-INode-ID order | deferred |
 | `ADMIN_META` | compat-write | fallback for admin RPCs |
@@ -1319,15 +1319,15 @@ When the count reaches 10, CI opens a blocking JIRA ticket `HDFS-XXXXX: FGL_IIP 
 
 **Gate summary:**
 
-10 RPCs migrated across 3 pilot modes:
+10 RPCs migrated at the gate trigger; 17 more migrated post-gate using the frozen template. Total: **27 RPCs** across 3 pilot modes (as of 2026-04-16):
 
 | Mode | RPCs |
 |---|---|
-| `PATH_READ` | `getFileInfo`, `getBlockLocations`, `isFileClosed`, `getListing` |
-| `PARENT_WRITE` | `startFile`, `mkdirs`, `delete` (single-file) |
-| `PATH_WRITE` | `setPermission`, `setOwner`, `setTimes`, `setReplication`, `setStoragePolicy` |
+| `PATH_READ` (11) | `getFileInfo`, `getBlockLocations`, `isFileClosed`, `getListing`, `getXAttrs`, `listXAttrs`, `getStoragePolicy`, `getPreferredBlockSize`, `getAclStatus`, `getErasureCodingPolicy`, `checkAccess` |
+| `PARENT_WRITE` (3) | `startFile`, `mkdirs`, `delete` (single-file) |
+| `PATH_WRITE` (15) | `setPermission`, `setOwner`, `setTimes`, `setReplication`, `setStoragePolicy`, `unsetStoragePolicy`, `setAcl`, `modifyAclEntries`, `removeAclEntries`, `removeDefaultAcl`, `removeAcl`, `setXAttr`, `removeXAttr`, `setErasureCodingPolicy`, `unsetErasureCodingPolicy` |
 
-Total lines in `FSNamesystem.java` attributable to pilot code after the gate: ~900 (down from ~1100 before the refactor, for the same functionality across 10× more RPCs than U8's pilot pair).
+Remaining ~13 RPCs are snapshot, rename, truncate/append, or admin operations that require deferred modes or deeper BM/lease handling.
 
 **Post-gate pattern (mechanical application).** New migrations must:
 
