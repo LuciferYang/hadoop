@@ -2733,20 +2733,50 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     FileStatus auditStat = null;
     checkOperation(OperationCategory.WRITE);
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+
+    // HDFS-17385: PARENT_WRITE on the link path (symlink is a new
+    // child in the parent directory, same as create/mkdirs).
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotParentWrite(link),
+        () -> {
+          IIPBasedFSNamesystemLock iipLock =
+              (IIPBasedFSNamesystemLock) fsLock;
+          try (LockedIIP lip = iipLock.lockPath(link,
+              IIPAcquireMode.PARENT_WRITE)) {
+            checkOperation(OperationCategory.WRITE);
+            checkNameNodeSafeMode("Cannot create symlink " + link);
+            INodesInPath iip = lip.iip();
+            INode parent = iip.length() >= 2 ? iip.getINode(-2) : null;
+            if (parent == null || !parent.isDirectory()) {
+              throw new PilotEnvelopeMissException(
+                  "createSymlink: parent missing " + link);
+            }
+            if (!ancestorsAllowCreate(iip)) {
+              throw new PilotEnvelopeMissException(
+                  "createSymlink: ancestor check " + link);
+            }
+            return FSDirSymlinkOp.createSymlinkInt(this, target, link,
+                dirPerms, createParent, logRetryCache);
+          }
+        }, operationName, link);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot create symlink " + link);
-        auditStat = FSDirSymlinkOp.createSymlinkInt(this, target, link,
-            dirPerms, createParent, logRetryCache);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(link, target, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot create symlink " + link);
+          auditStat = FSDirSymlinkOp.createSymlinkInt(this, target, link,
+              dirPerms, createParent, logRetryCache);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(link, target, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, link, target, null);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, link, target, null);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, link, target, auditStat);
@@ -2995,25 +3025,37 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       throws IOException {
     final String operationName = "satisfyStoragePolicy";
     checkOperation(OperationCategory.WRITE);
-    // make sure storage policy is enabled, otherwise
-    // there is no need to satisfy storage policy.
     checkStoragePolicyEnabled("satisfy storage policy", false);
     FileStatus auditStat = null;
     validateStoragePolicySatisfy();
-    try {
-      writeLock(RwLockMode.FS);
+
+    // HDFS-17385: PATH_WRITE. satisfyStoragePolicy sets an xattr
+    // on the target and schedules block moves via BM.
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> xattrWritePilot(src, getPermissionChecker(), iip ->
+            FSDirSatisfyStoragePolicyOp.satisfyStoragePolicy(
+                dir, blockManager, iip, logRetryCache)),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot satisfy storage policy for " + src);
-        auditStat = FSDirSatisfyStoragePolicyOp.satisfyStoragePolicy(
-            dir, blockManager, src, logRetryCache);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode(
+              "Cannot satisfy storage policy for " + src);
+          auditStat = FSDirSatisfyStoragePolicyOp.satisfyStoragePolicy(
+              dir, blockManager, src, logRetryCache);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
@@ -3531,6 +3573,49 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
+    final String srcArg = src;
+
+    // HDFS-17385: PATH_WRITE + BM write for lease recovery.
+    PilotResult<Boolean> pr = tryPilot(
+        () -> canUsePilotPathWrite(srcArg),
+        () -> {
+          IIPBasedFSNamesystemLock iipLock =
+              (IIPBasedFSNamesystemLock) fsLock;
+          try (LockedIIP lip = iipLock.lockPath(srcArg,
+              IIPAcquireMode.PATH_WRITE)) {
+            checkOperation(OperationCategory.WRITE);
+            checkNameNodeSafeMode("Cannot recover the lease of " + srcArg);
+            INodesInPath iip = lip.iip();
+            if (iip.getLastINode() == null || !iip.getLastINode().isFile()) {
+              throw new PilotEnvelopeMissException(
+                  "recoverLease: target missing or not a file " + srcArg);
+            }
+            if (!ancestorsAllowMutate(iip)) {
+              throw new PilotEnvelopeMissException(
+                  "recoverLease: ancestor check " + srcArg);
+            }
+            final INodeFile inode = INodeFile.valueOf(
+                iip.getLastINode(), iip.getPath());
+            if (!inode.isUnderConstruction()) {
+              return true;
+            }
+            if (isPermissionEnabled) {
+              dir.checkPathAccess(pc, iip, FsAction.WRITE);
+            }
+            writeLock(RwLockMode.BM);
+            try {
+              return recoverLeaseInternal(RecoverLeaseOp.RECOVER_LEASE,
+                  iip, iip.getPath(), holder, clientMachine, true);
+            } finally {
+              writeUnlock(RwLockMode.BM, operationName);
+            }
+          }
+        }, operationName, srcArg);
+    if (pr.handled) {
+      getEditLog().logSync();
+      return pr.value;
+    }
+
     writeLock(RwLockMode.GLOBAL);
     try {
       checkOperation(OperationCategory.WRITE);
@@ -3544,7 +3629,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       if (isPermissionEnabled) {
         dir.checkPathAccess(pc, iip, FsAction.WRITE);
       }
-  
+
       return recoverLeaseInternal(RecoverLeaseOp.RECOVER_LEASE,
           iip, src, holder, clientMachine, true);
     } catch (StandbyException se) {
@@ -3552,8 +3637,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       throw se;
     } finally {
       writeUnlock(RwLockMode.GLOBAL, operationName);
-      // There might be transactions logged while trying to recover the lease.
-      // They need to be sync'ed even when an exception was thrown.
       if (!skipSync) {
         getEditLog().logSync();
       }

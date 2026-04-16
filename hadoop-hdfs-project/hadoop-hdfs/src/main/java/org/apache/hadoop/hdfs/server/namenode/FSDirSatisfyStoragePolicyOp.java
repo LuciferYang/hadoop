@@ -115,6 +115,51 @@ final class FSDirSatisfyStoragePolicyOp {
     return fsd.getAuditFileInfo(iip);
   }
 
+  /** FGL_IIP pilot overload. */
+  static FileStatus satisfyStoragePolicy(FSDirectory fsd, BlockManager bm,
+      INodesInPath iip, boolean logRetryCache) throws IOException {
+    fsd.writeLock();
+    try {
+      if (fsd.isPermissionEnabled()) {
+        FSPermissionChecker pc = fsd.getPermissionChecker();
+        fsd.checkPathAccess(pc, iip, FsAction.WRITE);
+      }
+      INode inode = FSDirectory.resolveLastINode(iip);
+      if (inode.isFile() && inode.asFile().numBlocks() == 0) {
+        if (NameNode.LOG.isInfoEnabled()) {
+          NameNode.LOG.info(
+              "Skipping satisfy storage policy on path:{} as "
+                  + "this file doesn't have any blocks!",
+              inode.getFullPathName());
+        }
+      } else if (inodeHasSatisfyXAttr(inode)) {
+        NameNode.LOG.warn(
+            "Cannot request to call satisfy storage policy on path: "
+                + inode.getFullPathName()
+                + ", as this file/dir was already called for satisfying "
+                + "storage policy.");
+      } else {
+        XAttr satisfyXAttr = XAttrHelper
+            .buildXAttr(XATTR_SATISFY_STORAGE_POLICY);
+        List<XAttr> xAttrs = Arrays.asList(satisfyXAttr);
+        List<XAttr> existingXAttrs = XAttrStorage.readINodeXAttrs(inode);
+        List<XAttr> newXAttrs = FSDirXAttrOp.setINodeXAttrs(fsd,
+            existingXAttrs, xAttrs, EnumSet.of(XAttrSetFlag.CREATE));
+        XAttrStorage.updateINodeXAttrs(inode, newXAttrs,
+            iip.getLatestSnapshotId());
+        fsd.getEditLog().logSetXAttrs(iip.getPath(), xAttrs, logRetryCache);
+        StoragePolicySatisfyManager spsManager =
+            fsd.getBlockManager().getSPSManager();
+        if (spsManager != null) {
+          spsManager.addPathId(inode.getId());
+        }
+      }
+    } finally {
+      fsd.writeUnlock();
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
   static boolean unprotectedSatisfyStoragePolicy(INode inode, FSDirectory fsd) {
     if (inode.isFile() && inode.asFile().numBlocks() == 0) {
       return false;
