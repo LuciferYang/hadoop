@@ -2942,6 +2942,77 @@ public class TestFSNamesystemFGLIIP {
     assertTrue(status.getEntries().stream()
         .anyMatch(e -> "zz".equals(e.getName())));
   }
+
+  // ======================================================================
+  // truncate pilot (PATH_WRITE + nested BM write + lease).
+  // ======================================================================
+
+  /** Happy path: truncate on block boundary. */
+  @Test
+  @Timeout(60)
+  public void truncateOnBlockBoundary() throws Exception {
+    int blockSize = 512;
+    Path p = new Path("/trunc-boundary");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+        blockSize)) {
+      out.write(new byte[blockSize * 3]);
+    }
+    assertTrue(fs.truncate(p, blockSize));
+    assertEquals(blockSize, fs.getFileStatus(p).getLen());
+  }
+
+  /** Truncate not on block boundary — file goes under construction. */
+  @Test
+  @Timeout(120)
+  public void truncateNotOnBlockBoundary() throws Exception {
+    int blockSize = 512;
+    Path p = new Path("/trunc-mid");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+        blockSize)) {
+      out.write(new byte[blockSize * 2]);
+    }
+    boolean onBoundary = fs.truncate(p, blockSize + 100);
+    if (!onBoundary) {
+      int retries = 60;
+      while (retries-- > 0 && !fs.isFileClosed(p)) {
+        Thread.sleep(500);
+      }
+    }
+    assertEquals(blockSize + 100, fs.getFileStatus(p).getLen());
+  }
+
+  /** Truncate to same length is a no-op. */
+  @Test
+  @Timeout(60)
+  public void truncateToSameLengthIsNoop() throws Exception {
+    Path p = new Path("/trunc-noop");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+        512)) {
+      out.write(new byte[512]);
+    }
+    assertTrue(fs.truncate(p, 512));
+    assertEquals(512, fs.getFileStatus(p).getLen());
+  }
+
+  /** Truncate to larger length fails. */
+  @Test
+  @Timeout(60)
+  public void truncateToLargerLengthFails() throws Exception {
+    Path p = new Path("/trunc-larger");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+        512)) {
+      out.write(new byte[100]);
+    }
+    assertThrows(IOException.class, () -> fs.truncate(p, 200));
+  }
+
+  /** Truncate on missing target fails. */
+  @Test
+  @Timeout(60)
+  public void truncateOnMissingTargetFails() throws Exception {
+    assertThrows(IOException.class,
+        () -> fs.truncate(new Path("/trunc-missing"), 0));
+  }
 }
 
 

@@ -2642,30 +2642,80 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       checkOperation(OperationCategory.WRITE);
       final FSPermissionChecker pc = getPermissionChecker();
       FSPermissionChecker.setOperationType(operationName);
-      writeLock(RwLockMode.GLOBAL);
       BlocksMapUpdateInfo toRemoveBlocks = new BlocksMapUpdateInfo();
-      try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot truncate for " + src);
-        r = FSDirTruncateOp.truncate(this, src, newLength, clientName,
-            clientMachine, mtime, toRemoveBlocks, pc);
-      } finally {
-        status = r != null ? r.getFileStatus() : null;
-        writeUnlock(RwLockMode.GLOBAL, operationName,
-            getLockReportInfoSupplier(src, null, status));
+
+      // HDFS-17385 Phase II pilot: PATH_WRITE + nested BM write.
+      PilotResult<FSDirTruncateOp.TruncateResult> pr = tryPilot(
+          () -> canUsePilotPathWrite(src),
+          () -> truncatePilot(src, newLength, clientName, clientMachine,
+              mtime, toRemoveBlocks, pc),
+          operationName, src);
+      if (pr.handled) {
+        r = pr.value;
+      } else {
+        writeLock(RwLockMode.GLOBAL);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot truncate for " + src);
+          r = FSDirTruncateOp.truncate(this, src, newLength, clientName,
+              clientMachine, mtime, toRemoveBlocks, pc);
+        } finally {
+          status = r != null ? r.getFileStatus() : null;
+          writeUnlock(RwLockMode.GLOBAL, operationName,
+              getLockReportInfoSupplier(src, null, status));
+        }
       }
       getEditLog().logSync();
       if (!toRemoveBlocks.getToDeleteList().isEmpty()) {
         blockManager.addBLocksToMarkedDeleteQueue(
             toRemoveBlocks.getToDeleteList());
       }
-      logAuditEvent(true, operationName, src, null, status);
+      logAuditEvent(true, operationName, src, null,
+          r != null ? r.getFileStatus() : null);
     } catch (AccessControlException e) {
       logAuditEvent(false, operationName, src);
       throw e;
     }
     assert(r != null);
     return r.getResult();
+  }
+
+  /**
+   * FGL_IIP pilot for {@code truncate}. PATH_WRITE + nested BM write
+   * (same nesting pattern as setReplication). Truncate interacts with
+   * LeaseManager (via recoverLeaseInternal) and BlockManager (via
+   * prepareFileForTruncate). Both are nested under the IIP lock per
+   * checklist rules 4 and the LeaseManager discipline.
+   */
+  private FSDirTruncateOp.TruncateResult truncatePilot(String src,
+      long newLength, String clientName, String clientMachine,
+      long mtime, BlocksMapUpdateInfo toRemoveBlocks,
+      FSPermissionChecker pc) throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot truncate for " + src);
+      INodesInPath iip = lip.iip();
+      if (iip.getLastINode() == null || !iip.getLastINode().isFile()) {
+        throw new PilotEnvelopeMissException(
+            "truncate: target missing or not a file " + src);
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        throw new PilotEnvelopeMissException(
+            "truncate: ancestor has snapshot/quota/storage-policy " + src);
+      }
+      // BM write lock nested under PATH_WRITE — same pattern as
+      // setReplication. Truncate mutates BM state via
+      // prepareFileForTruncate (addBlockCollection,
+      // convertLastBlockToUnderConstruction).
+      writeLock(RwLockMode.BM);
+      try {
+        return FSDirTruncateOp.truncate(this, iip, newLength, clientName,
+            clientMachine, mtime, toRemoveBlocks, pc);
+      } finally {
+        writeUnlock(RwLockMode.BM, "truncate");
+      }
+    }
   }
 
   /**

@@ -158,6 +158,84 @@ final class FSDirTruncateOp {
   }
 
   /**
+   * FGL_IIP pilot overload. Caller has already acquired
+   * {@code PATH_WRITE} on the target AND the BM write lock (nested).
+   * Skips {@code fsd.resolvePath}; everything else mirrors the
+   * legacy method.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  static TruncateResult truncate(final FSNamesystem fsn,
+      final INodesInPath iip, final long newLength,
+      final String clientName, final String clientMachine,
+      final long mtime, final BlocksMapUpdateInfo toRemoveBlocks,
+      final FSPermissionChecker pc) throws IOException {
+    FSDirectory fsd = fsn.getFSDirectory();
+    final String src = iip.getPath();
+    final boolean onBlockBoundary;
+    Block truncateBlock = null;
+    fsd.writeLock();
+    try {
+      if (fsd.isPermissionEnabled()) {
+        fsd.checkPathAccess(pc, iip, FsAction.WRITE);
+      }
+      INodeFile file = INodeFile.valueOf(iip.getLastINode(), src);
+      if (file.isStriped()) {
+        throw new UnsupportedOperationException(
+            "Cannot truncate file with striped block " + src);
+      }
+      final BlockStoragePolicy lpPolicy = fsd.getBlockManager()
+          .getStoragePolicy("LAZY_PERSIST");
+      if (lpPolicy != null && lpPolicy.getId() == file.getStoragePolicyID()) {
+        throw new UnsupportedOperationException(
+            "Cannot truncate lazy persist file " + src);
+      }
+      final BlockInfo last = file.getLastBlock();
+      if (last != null && last.getBlockUCState()
+          == BlockUCState.UNDER_RECOVERY) {
+        final BlockInfo truncatedBlock = last.getUnderConstructionFeature()
+            .getTruncateBlock();
+        if (truncatedBlock != null) {
+          final long truncateLength = file.computeFileSize(false, false)
+              + truncatedBlock.getNumBytes();
+          if (newLength == truncateLength) {
+            return new TruncateResult(false, fsd.getAuditFileInfo(iip));
+          } else {
+            throw new AlreadyBeingCreatedException(
+                RecoverLeaseOp.TRUNCATE_FILE.getExceptionMessage(src,
+                    clientName, clientMachine, src + " is being truncated."));
+          }
+        }
+      }
+      fsn.recoverLeaseInternal(RecoverLeaseOp.TRUNCATE_FILE, iip, src,
+          clientName, clientMachine, false);
+      long oldLength = file.computeFileSize();
+      if (oldLength == newLength) {
+        return new TruncateResult(true, fsd.getAuditFileInfo(iip));
+      }
+      if (oldLength < newLength) {
+        throw new HadoopIllegalArgumentException(
+            "Cannot truncate to a larger file size. Current size: " + oldLength
+                + ", truncate size: " + newLength + ".");
+      }
+      final QuotaCounts delta = new QuotaCounts.Builder().build();
+      onBlockBoundary = unprotectedTruncate(fsn, iip, newLength,
+          toRemoveBlocks, mtime, delta);
+      if (!onBlockBoundary) {
+        long lastBlockDelta = file.computeFileSize() - newLength;
+        truncateBlock = prepareFileForTruncate(fsn, iip, clientName,
+            clientMachine, lastBlockDelta, null);
+      }
+      fsd.updateCountNoQuotaCheck(iip, iip.length() - 1, delta);
+    } finally {
+      fsd.writeUnlock();
+    }
+    fsn.getEditLog().logTruncate(src, clientName, clientMachine, newLength,
+        mtime, truncateBlock);
+    return new TruncateResult(onBlockBoundary, fsd.getAuditFileInfo(iip));
+  }
+
+  /**
    * Unprotected truncate implementation. Unlike
    * {@link FSDirTruncateOp#truncate}, this will not schedule block recovery.
    *
