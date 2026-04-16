@@ -3065,6 +3065,15 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.READ);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
+
+    PilotResult<BlockStoragePolicy> pr = tryPilot(
+        () -> canUsePilotPathRead(src),
+        () -> xattrReadPilot(src, pc, iip ->
+            FSDirAttrOp.getStoragePolicy(dir, pc, blockManager, iip)),
+        operationName, src);
+    if (pr.handled) {
+      return pr.value;
+    }
     readLock(RwLockMode.FS);
     try {
       checkOperation(OperationCategory.READ);
@@ -3094,6 +3103,15 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.READ);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
+
+    PilotResult<Long> pr = tryPilot(
+        () -> canUsePilotPathRead(src),
+        () -> xattrReadPilot(src, pc, iip ->
+            FSDirAttrOp.getPreferredBlockSize(dir, iip)),
+        operationName, src);
+    if (pr.handled) {
+      return pr.value;
+    }
     readLock(RwLockMode.FS);
     try {
       checkOperation(OperationCategory.READ);
@@ -9456,6 +9474,16 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final AclStatus ret;
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
+
+    PilotResult<AclStatus> pr = tryPilot(
+        () -> canUsePilotPathRead(src),
+        () -> xattrReadPilot(src, pc, iip ->
+            FSDirAclOp.getAclStatus(dir, pc, iip)),
+        operationName, src);
+    if (pr.handled) {
+      logAuditEvent(true, operationName, src);
+      return pr.value;
+    }
     try {
       readLock(RwLockMode.FS);
       try {

@@ -2891,6 +2891,57 @@ public class TestFSNamesystemFGLIIP {
     assertThrows(IOException.class,
         () -> fs.removeXAttr(new Path("/xa-missing"), "user.x"));
   }
+
+  // ======================================================================
+  // getStoragePolicy + getPreferredBlockSize + getAclStatus
+  // pilot (RPCs #21–#23).
+  // ======================================================================
+
+  /** getStoragePolicy round-trip with setStoragePolicy. */
+  @Test
+  @Timeout(60)
+  public void getStoragePolicyOnFile() throws Exception {
+    Path p = new Path("/gsp-file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096,
+        (short) 1, 4096L)) {
+      out.write(new byte[4]);
+    }
+    fs.setStoragePolicy(p, HdfsConstants.HOT_STORAGE_POLICY_NAME);
+    org.apache.hadoop.hdfs.protocol.BlockStoragePolicy pol =
+        fs.getClient().getStoragePolicy(p.toString());
+    assertEquals(HdfsConstants.HOT_STORAGE_POLICY_ID, pol.getId());
+  }
+
+  /** getPreferredBlockSize reads the block size set at creation. */
+  @Test
+  @Timeout(60)
+  public void getPreferredBlockSizeOnFile() throws Exception {
+    long expected = 8192L;
+    Path p = new Path("/gpbs-file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096,
+        (short) 1, expected)) {
+      out.write(new byte[4]);
+    }
+    long actual = fs.getClient().getBlockSize(p.toString());
+    assertEquals(expected, actual);
+  }
+
+  /** getAclStatus returns ACL entries set via pilot setAcl. */
+  @Test
+  @Timeout(60)
+  public void getAclStatusOnFile() throws Exception {
+    Path p = new Path("/gas-file");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[4]);
+    }
+    java.util.List<org.apache.hadoop.fs.permission.AclEntry> acl =
+        org.apache.hadoop.fs.permission.AclEntry.parseAclSpec(
+            "user::rwx,group::r--,other::r--,user:zz:rwx", true);
+    fs.setAcl(p, acl);
+    org.apache.hadoop.fs.permission.AclStatus status = fs.getAclStatus(p);
+    assertTrue(status.getEntries().stream()
+        .anyMatch(e -> "zz".equals(e.getName())));
+  }
 }
 
 

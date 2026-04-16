@@ -374,6 +374,21 @@ public class FSDirAttrOp {
     }
   }
 
+  /** FGL_IIP pilot overload. */
+  static BlockStoragePolicy getStoragePolicy(FSDirectory fsd,
+      FSPermissionChecker pc, BlockManager bm, INodesInPath iip)
+      throws IOException {
+    if (fsd.isPermissionEnabled()) {
+      fsd.checkPathAccess(pc, iip, FsAction.READ);
+    }
+    INode inode = iip.getLastINode();
+    if (inode == null) {
+      throw new FileNotFoundException("File/Directory does not exist: "
+          + iip.getPath());
+    }
+    return bm.getStoragePolicy(inode.getStoragePolicyID());
+  }
+
   static long getPreferredBlockSize(FSDirectory fsd, FSPermissionChecker pc,
       String src) throws IOException {
     fsd.readLock();
@@ -384,6 +399,13 @@ public class FSDirAttrOp {
     } finally {
       fsd.readUnlock();
     }
+  }
+
+  /** FGL_IIP pilot overload. */
+  static long getPreferredBlockSize(FSDirectory fsd, INodesInPath iip)
+      throws IOException {
+    return INodeFile.valueOf(iip.getLastINode(), iip.getPath())
+        .getPreferredBlockSize();
   }
 
   /**

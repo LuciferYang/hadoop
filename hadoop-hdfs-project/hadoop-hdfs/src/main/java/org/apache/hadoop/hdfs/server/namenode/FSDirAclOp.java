@@ -282,6 +282,21 @@ class FSDirAclOp {
     }
   }
 
+  /** FGL_IIP pilot overload. Pilot rejects .snapshot paths in envelope. */
+  static AclStatus getAclStatus(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip)
+      throws IOException {
+    checkAclsConfigFlag(fsd);
+    INodeAttributes inodeAttrs = fsd.getAttributes(iip);
+    List<AclEntry> acl = AclStorage.readINodeAcl(inodeAttrs);
+    FsPermission fsPermission = inodeAttrs.getFsPermission();
+    return new AclStatus.Builder()
+        .owner(inodeAttrs.getUserName()).group(inodeAttrs.getGroupName())
+        .stickyBit(fsPermission.getStickyBit())
+        .setPermission(fsPermission)
+        .addEntries(acl).build();
+  }
+
   static List<AclEntry> unprotectedSetAcl(FSDirectory fsd, INodesInPath iip,
       List<AclEntry> aclSpec, boolean fromEdits) throws IOException {
     assert fsd.hasWriteLock();
