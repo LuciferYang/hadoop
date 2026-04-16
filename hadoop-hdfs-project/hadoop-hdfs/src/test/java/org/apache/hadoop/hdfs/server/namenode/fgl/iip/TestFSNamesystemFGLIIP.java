@@ -2828,6 +2828,69 @@ public class TestFSNamesystemFGLIIP {
     fs.removeAcl(p);
     assertEquals(0, fs.getAclStatus(p).getEntries().size());
   }
+
+  // ======================================================================
+  // xattr cluster (RPCs #17–#20).
+  // ======================================================================
+
+  /** setXAttr + getXAttrs round-trip. */
+  @Test
+  @Timeout(60)
+  public void setAndGetXAttr() throws Exception {
+    Path p = new Path("/xa-set");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[4]);
+    }
+    byte[] value = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    fs.setXAttr(p, "user.myattr", value);
+    byte[] got = fs.getXAttr(p, "user.myattr");
+    assertNotNull(got);
+    assertEquals("hello", new String(got,
+        java.nio.charset.StandardCharsets.UTF_8));
+  }
+
+  /** listXAttrs returns set xattrs. */
+  @Test
+  @Timeout(60)
+  public void listXAttrsReturnsSetAttrs() throws Exception {
+    Path p = new Path("/xa-list");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[4]);
+    }
+    fs.setXAttr(p, "user.a", new byte[]{1});
+    fs.setXAttr(p, "user.b", new byte[]{2});
+    java.util.Map<String, byte[]> map = fs.getXAttrs(p);
+    assertTrue(map.containsKey("user.a"));
+    assertTrue(map.containsKey("user.b"));
+  }
+
+  /** removeXAttr removes the named attribute. */
+  @Test
+  @Timeout(60)
+  public void removeXAttrRemovesEntry() throws Exception {
+    Path p = new Path("/xa-rm");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[4]);
+    }
+    fs.setXAttr(p, "user.todel", new byte[]{99});
+    assertNotNull(fs.getXAttr(p, "user.todel"));
+    fs.removeXAttr(p, "user.todel");
+    assertThrows(IOException.class,
+        () -> fs.getXAttr(p, "user.todel"));
+  }
+
+  /** xattr operations on missing target → failure. */
+  @Test
+  @Timeout(60)
+  public void xattrOnMissingTargetFails() throws Exception {
+    assertThrows(IOException.class,
+        () -> fs.setXAttr(new Path("/xa-missing"), "user.x",
+            new byte[]{1}));
+    assertThrows(IOException.class,
+        () -> fs.getXAttr(new Path("/xa-missing"), "user.x"));
+    assertThrows(IOException.class,
+        () -> fs.removeXAttr(new Path("/xa-missing"), "user.x"));
+  }
 }
 
 

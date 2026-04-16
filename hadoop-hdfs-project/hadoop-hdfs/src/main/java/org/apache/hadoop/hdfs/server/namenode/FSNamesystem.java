@@ -9980,20 +9980,30 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> xattrWritePilot(src, pc, iip ->
+            FSDirXAttrOp.setXAttr(dir, pc, iip, xAttr, flag, logRetryCache)),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot set XAttr on " + src);
-        auditStat = FSDirXAttrOp.setXAttr(dir, pc, src, xAttr, flag,
-            logRetryCache);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot set XAttr on " + src);
+          auditStat = FSDirXAttrOp.setXAttr(dir, pc, src, xAttr, flag,
+              logRetryCache);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
@@ -10006,17 +10016,27 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     List<XAttr> fsXattrs;
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      readLock(RwLockMode.FS);
+
+    PilotResult<List<XAttr>> pr = tryPilot(
+        () -> canUsePilotPathRead(src),
+        () -> xattrReadPilot(src, pc, iip ->
+            FSDirXAttrOp.getXAttrs(dir, pc, iip, xAttrs)),
+        operationName, src);
+    if (pr.handled) {
+      fsXattrs = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.READ);
-        fsXattrs = FSDirXAttrOp.getXAttrs(dir, pc, src, xAttrs);
-      } finally {
-        readUnlock(RwLockMode.FS, operationName, getLockReportInfoSupplier(src));
+        readLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.READ);
+          fsXattrs = FSDirXAttrOp.getXAttrs(dir, pc, src, xAttrs);
+        } finally {
+          readUnlock(RwLockMode.FS, operationName, getLockReportInfoSupplier(src));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     logAuditEvent(true, operationName, src);
     return fsXattrs;
@@ -10028,17 +10048,27 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     List<XAttr> fsXattrs;
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      readLock(RwLockMode.FS);
+
+    PilotResult<List<XAttr>> pr = tryPilot(
+        () -> canUsePilotPathRead(src),
+        () -> xattrReadPilot(src, pc, iip ->
+            FSDirXAttrOp.listXAttrs(dir, pc, iip)),
+        operationName, src);
+    if (pr.handled) {
+      fsXattrs = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.READ);
-        fsXattrs = FSDirXAttrOp.listXAttrs(dir, pc, src);
-      } finally {
-        readUnlock(RwLockMode.FS, operationName, getLockReportInfoSupplier(src));
+        readLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.READ);
+          fsXattrs = FSDirXAttrOp.listXAttrs(dir, pc, src);
+        } finally {
+          readUnlock(RwLockMode.FS, operationName, getLockReportInfoSupplier(src));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     logAuditEvent(true, operationName, src);
     return fsXattrs;
@@ -10051,23 +10081,87 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> xattrWritePilot(src, pc, iip ->
+            FSDirXAttrOp.removeXAttr(dir, pc, iip, xAttr, logRetryCache)),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot remove XAttr entry on " + src);
-        auditStat = FSDirXAttrOp.removeXAttr(dir, pc, src, xAttr,
-            logRetryCache);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot remove XAttr entry on " + src);
+          auditStat = FSDirXAttrOp.removeXAttr(dir, pc, src, xAttr,
+              logRetryCache);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
+  }
+
+  /**
+   * Shared pilot body for xattr write RPCs (setXAttr, removeXAttr).
+   * PATH_WRITE + target-exists + ancestorsAllowMutate + delegate.
+   */
+  @FunctionalInterface
+  interface XAttrWriteAction {
+    FileStatus apply(INodesInPath iip) throws IOException;
+  }
+
+  private FileStatus xattrWritePilot(String src, FSPermissionChecker pc,
+      XAttrWriteAction action) throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot modify XAttr on " + src);
+      INodesInPath iip = lip.iip();
+      if (iip.getLastINode() == null) {
+        throw new PilotEnvelopeMissException(
+            "xattr write: target does not exist " + src);
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        throw new PilotEnvelopeMissException(
+            "xattr write: ancestor has snapshot/quota/storage-policy " + src);
+      }
+      return action.apply(iip);
+    }
+  }
+
+  /**
+   * Shared pilot body for xattr read RPCs (getXAttrs, listXAttrs).
+   * PATH_READ + checkTraverse + delegate.
+   */
+  @FunctionalInterface
+  interface XAttrReadAction<R> {
+    R apply(INodesInPath iip) throws IOException;
+  }
+
+  private <R> R xattrReadPilot(String src, FSPermissionChecker pc,
+      XAttrReadAction<R> action) throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_READ)) {
+      checkOperation(OperationCategory.READ);
+      try {
+        dir.checkTraverse(pc, lip.iip(), DirOp.READ);
+      } catch (org.apache.hadoop.fs.ParentNotDirectoryException pnde) {
+        if (pc.isSuperUser()) {
+          throw pnde;
+        }
+        throw new AccessControlException(pnde.getMessage());
+      }
+      return action.apply(lip.iip());
+    }
   }
 
   @Override

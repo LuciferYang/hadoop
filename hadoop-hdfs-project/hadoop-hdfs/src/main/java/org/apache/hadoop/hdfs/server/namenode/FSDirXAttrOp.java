@@ -94,6 +94,96 @@ public class FSDirXAttrOp {
     return fsd.getAuditFileInfo(iip);
   }
 
+  /** FGL_IIP pilot overload of {@link #setXAttr}. */
+  static FileStatus setXAttr(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip, XAttr xAttr,
+      EnumSet<XAttrSetFlag> flag, boolean logRetryCache)
+      throws IOException {
+    List<XAttr> xAttrs = Lists.newArrayListWithCapacity(1);
+    xAttrs.add(xAttr);
+    fsd.writeLock();
+    try {
+      checkXAttrChangeAccess(fsd, iip, xAttr, pc);
+      unprotectedSetXAttrs(fsd, iip, xAttrs, flag);
+    } finally {
+      fsd.writeUnlock();
+    }
+    fsd.getEditLog().logSetXAttrs(iip.getPath(), xAttrs, logRetryCache);
+    return fsd.getAuditFileInfo(iip);
+  }
+
+  /** FGL_IIP pilot overload of {@link #getXAttrs}. isRawPath is always
+   *  false because pilot rejects /.reserved. */
+  static List<XAttr> getXAttrs(FSDirectory fsd, FSPermissionChecker pc,
+      INodesInPath iip, List<XAttr> xAttrs) throws IOException {
+    boolean getAll = xAttrs == null || xAttrs.isEmpty();
+    if (!getAll) {
+      XAttrPermissionFilter.checkPermissionForApi(pc, xAttrs, false);
+    }
+    if (fsd.isPermissionEnabled()) {
+      fsd.checkPathAccess(pc, iip, FsAction.READ);
+    }
+    List<XAttr> all = FSDirXAttrOp.getXAttrs(fsd, iip);
+    List<XAttr> filteredAll = XAttrPermissionFilter.filterXAttrsForApi(
+        pc, all, false);
+    if (getAll) {
+      return filteredAll;
+    }
+    if (filteredAll == null || filteredAll.isEmpty()) {
+      throw new XAttrNotFoundException();
+    }
+    List<XAttr> toGet = Lists.newArrayListWithCapacity(xAttrs.size());
+    for (XAttr xAttr : xAttrs) {
+      boolean foundIt = false;
+      for (XAttr a : filteredAll) {
+        if (xAttr.getNameSpace() == a.getNameSpace()
+            && xAttr.getName().equals(a.getName())) {
+          toGet.add(a);
+          foundIt = true;
+          break;
+        }
+      }
+      if (!foundIt) {
+        throw new XAttrNotFoundException();
+      }
+    }
+    return toGet;
+  }
+
+  /** FGL_IIP pilot overload of {@link #listXAttrs}. */
+  static List<XAttr> listXAttrs(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip)
+      throws IOException {
+    if (fsd.isPermissionEnabled()) {
+      fsd.checkPathAccess(pc, iip, FsAction.READ);
+    }
+    final List<XAttr> all = FSDirXAttrOp.getXAttrs(fsd, iip);
+    return XAttrPermissionFilter.filterXAttrsForApi(pc, all, false);
+  }
+
+  /** FGL_IIP pilot overload of {@link #removeXAttr}. */
+  static FileStatus removeXAttr(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip, XAttr xAttr,
+      boolean logRetryCache) throws IOException {
+    List<XAttr> xAttrs = Lists.newArrayListWithCapacity(1);
+    xAttrs.add(xAttr);
+    fsd.writeLock();
+    try {
+      checkXAttrChangeAccess(fsd, iip, xAttr, pc);
+      List<XAttr> removedXAttrs = unprotectedRemoveXAttrs(fsd, iip, xAttrs);
+      if (removedXAttrs != null && !removedXAttrs.isEmpty()) {
+        fsd.getEditLog().logRemoveXAttrs(iip.getPath(), removedXAttrs,
+            logRetryCache);
+      } else {
+        throw new IOException(
+            "No matching attributes found for remove operation");
+      }
+    } finally {
+      fsd.writeUnlock();
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
   static List<XAttr> getXAttrs(FSDirectory fsd, FSPermissionChecker pc,
       final String srcArg, List<XAttr> xAttrs) throws IOException {
     String src = srcArg;
