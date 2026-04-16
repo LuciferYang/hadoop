@@ -3013,6 +3013,56 @@ public class TestFSNamesystemFGLIIP {
     assertThrows(IOException.class,
         () -> fs.truncate(new Path("/trunc-missing"), 0));
   }
+
+  // ======================================================================
+  // append pilot (PATH_WRITE + nested BM write + lease).
+  // ======================================================================
+
+  /** Happy path: append to an existing file. */
+  @Test
+  @Timeout(60)
+  public void appendToExistingFile() throws Exception {
+    Path p = new Path("/app-happy");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[64]);
+    }
+    try (FSDataOutputStream out = fs.append(p)) {
+      out.write(new byte[32]);
+    }
+    assertEquals(96, fs.getFileStatus(p).getLen());
+  }
+
+  /** Append to missing path fails. */
+  @Test
+  @Timeout(60)
+  public void appendToMissingPathFails() throws Exception {
+    assertThrows(IOException.class, () -> fs.append(new Path("/app-missing")));
+  }
+
+  /** Append to a directory fails. */
+  @Test
+  @Timeout(60)
+  public void appendToDirectoryFails() throws Exception {
+    Path dir = new Path("/app-dir");
+    fs.mkdirs(dir);
+    assertThrows(IOException.class, () -> fs.append(dir));
+  }
+
+  /** Multiple sequential appends accumulate data. */
+  @Test
+  @Timeout(60)
+  public void multipleSequentialAppends() throws Exception {
+    Path p = new Path("/app-multi");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[10]);
+    }
+    for (int i = 0; i < 5; i++) {
+      try (FSDataOutputStream out = fs.append(p)) {
+        out.write(new byte[10]);
+      }
+    }
+    assertEquals(60, fs.getFileStatus(p).getLen());
+  }
 }
 
 

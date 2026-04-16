@@ -162,6 +162,85 @@ final class FSDirAppendOp {
   }
 
   /**
+   * FGL_IIP pilot overload. Caller has already acquired
+   * {@code PATH_WRITE} on the target AND the BM write lock (nested).
+   * Skips {@code fsd.resolvePath}; everything else mirrors the
+   * legacy method.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
+   */
+  static LastBlockWithStatus appendFile(final FSNamesystem fsn,
+      final INodesInPath iip, final FSPermissionChecker pc,
+      final String holder, final String clientMachine,
+      final boolean newBlock, final boolean logRetryCache)
+      throws IOException {
+    final LocatedBlock lb;
+    final FSDirectory fsd = fsn.getFSDirectory();
+    fsd.writeLock();
+    try {
+      final INode inode = iip.getLastINode();
+      final String path = iip.getPath();
+      if (inode != null && inode.isDirectory()) {
+        throw new FileAlreadyExistsException("Cannot append to directory "
+            + path + "; already exists as a directory.");
+      }
+      if (fsd.isPermissionEnabled()) {
+        fsd.checkPathAccess(pc, iip, FsAction.WRITE);
+      }
+      if (inode == null) {
+        throw new FileNotFoundException(
+            "Failed to append to non-existent file " + path + " for client "
+                + clientMachine);
+      }
+      final INodeFile file = INodeFile.valueOf(inode, path, true);
+      if (file.isStriped() && !newBlock) {
+        throw new UnsupportedOperationException(
+            "Append on EC file without new block is not supported. Use "
+                + CreateFlag.NEW_BLOCK + " create flag while appending file.");
+      }
+      BlockManager blockManager = fsd.getBlockManager();
+      final BlockStoragePolicy lpPolicy = blockManager
+          .getStoragePolicy("LAZY_PERSIST");
+      if (lpPolicy != null && lpPolicy.getId() == file.getStoragePolicyID()) {
+        throw new UnsupportedOperationException(
+            "Cannot append to lazy persist file " + path);
+      }
+      fsn.recoverLeaseInternal(RecoverLeaseOp.APPEND_FILE, iip, path, holder,
+          clientMachine, false);
+      final BlockInfo lastBlock = file.getLastBlock();
+      if (lastBlock != null) {
+        if (lastBlock.getBlockUCState() == BlockUCState.COMMITTED) {
+          throw new RetriableException(
+              new NotReplicatedYetException("append: lastBlock="
+                  + lastBlock + " of src=" + path
+                  + " is COMMITTED but not yet COMPLETE."));
+        } else if (lastBlock.isComplete()
+            && !blockManager.isSufficientlyReplicated(lastBlock)) {
+          throw new IOException("append: lastBlock=" + lastBlock + " of src="
+              + path + " is not sufficiently replicated yet.");
+        }
+      }
+      lb = prepareFileForAppend(fsn, iip, holder, clientMachine, newBlock,
+          true, logRetryCache);
+    } catch (IOException ie) {
+      NameNode.stateChangeLog
+          .warn("DIR* NameSystem.append: " + ie.getMessage());
+      throw ie;
+    } finally {
+      fsd.writeUnlock();
+    }
+    HdfsFileStatus stat =
+        FSDirStatAndListingOp.getFileInfo(fsd, iip, false, false);
+    if (lb != null) {
+      NameNode.stateChangeLog.debug(
+          "DIR* NameSystem.appendFile: file {} for {} at {} block {} block"
+              + " size {}", iip.getPath(), holder, clientMachine,
+          lb.getBlock(), lb.getBlock().getNumBytes());
+    }
+    return new LastBlockWithStatus(lb, stat);
+  }
+
+  /**
    * Convert current node to under construction.
    * Recreate in-memory lease record.
    *

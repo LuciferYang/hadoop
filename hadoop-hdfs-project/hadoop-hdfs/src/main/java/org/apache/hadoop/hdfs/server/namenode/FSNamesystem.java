@@ -3661,7 +3661,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       requireEffectiveLayoutVersionForFeature(Feature.APPEND_NEW_BLOCK);
     }
 
-    NameNode.stateChangeLog.debug("DIR* NameSystem.appendFile: src={}, holder={}, clientMachine={}",
+    NameNode.stateChangeLog.debug(
+        "DIR* NameSystem.appendFile: src={}, holder={}, clientMachine={}",
         srcArg, holder, clientMachine);
     try {
       boolean skipSync = false;
@@ -3669,21 +3670,31 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       checkOperation(OperationCategory.WRITE);
       final FSPermissionChecker pc = getPermissionChecker();
       FSPermissionChecker.setOperationType(operationName);
-      writeLock(RwLockMode.GLOBAL);
-      try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot append to file" + srcArg);
-        lbs = FSDirAppendOp.appendFile(this, srcArg, pc, holder, clientMachine,
-            newBlock, logRetryCache);
-      } catch (StandbyException se) {
-        skipSync = true;
-        throw se;
-      } finally {
-        writeUnlock(RwLockMode.GLOBAL, operationName, getLockReportInfoSupplier(srcArg));
-        // There might be transactions logged while trying to recover the lease
-        // They need to be sync'ed even when an exception was thrown.
-        if (!skipSync) {
-          getEditLog().logSync();
+
+      // HDFS-17385 Phase II pilot: PATH_WRITE + nested BM write.
+      PilotResult<LastBlockWithStatus> pr = tryPilot(
+          () -> canUsePilotPathWrite(srcArg),
+          () -> appendFilePilot(srcArg, pc, holder, clientMachine,
+              newBlock, logRetryCache),
+          operationName, srcArg);
+      if (pr.handled) {
+        lbs = pr.value;
+      } else {
+        writeLock(RwLockMode.GLOBAL);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot append to file" + srcArg);
+          lbs = FSDirAppendOp.appendFile(this, srcArg, pc, holder,
+              clientMachine, newBlock, logRetryCache);
+        } catch (StandbyException se) {
+          skipSync = true;
+          throw se;
+        } finally {
+          writeUnlock(RwLockMode.GLOBAL, operationName,
+              getLockReportInfoSupplier(srcArg));
+          if (!skipSync) {
+            getEditLog().logSync();
+          }
         }
       }
       logAuditEvent(true, operationName, srcArg);
@@ -3691,6 +3702,51 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     } catch (AccessControlException e) {
       logAuditEvent(false, operationName, srcArg);
       throw e;
+    }
+  }
+
+  /**
+   * FGL_IIP pilot for {@code appendFile}. PATH_WRITE + nested BM
+   * write (same pattern as truncate). Append interacts with
+   * LeaseManager (via recoverLeaseInternal) and BlockManager (via
+   * prepareFileForAppend).
+   */
+  private LastBlockWithStatus appendFilePilot(String src,
+      FSPermissionChecker pc, String holder, String clientMachine,
+      boolean newBlock, boolean logRetryCache)
+      throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    boolean skipSync = false;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot append to file" + src);
+      INodesInPath iip = lip.iip();
+      if (iip.getLastINode() == null) {
+        throw new PilotEnvelopeMissException(
+            "append: target does not exist " + src);
+      }
+      if (!iip.getLastINode().isFile()) {
+        throw new PilotEnvelopeMissException(
+            "append: target is not a file " + src);
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        throw new PilotEnvelopeMissException(
+            "append: ancestor has snapshot/quota/storage-policy " + src);
+      }
+      writeLock(RwLockMode.BM);
+      try {
+        return FSDirAppendOp.appendFile(this, iip, pc, holder,
+            clientMachine, newBlock, logRetryCache);
+      } catch (StandbyException se) {
+        skipSync = true;
+        throw se;
+      } finally {
+        writeUnlock(RwLockMode.BM, "append");
+      }
+    } finally {
+      if (!skipSync) {
+        getEditLog().logSync();
+      }
     }
   }
 
