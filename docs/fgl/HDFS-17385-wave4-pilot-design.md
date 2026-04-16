@@ -88,6 +88,93 @@ All seven modes are declared in the enum; the two still-deferred modes throw `Un
 
 `PATH_WRITE` was originally DEFERRED in the initial pilot cut and promoted to PILOT ahead of the §6.3 RPC-10 refactor gate. Front-loading the mode gives the gate review a third data-point mode (alongside `PATH_READ` and `PARENT_WRITE`) rather than five post-pilot RPCs discovering `PATH_WRITE` after the pattern is frozen.
 
+### 1.4a RPC migration tracking
+
+Comprehensive status of every NameNode RPC that takes a namespace lock (`RwLockMode.FS` or `RwLockMode.GLOBAL`) in `FSNamesystem`. Updated 2026-04-16.
+
+**Migrated (31 RPCs):**
+
+| RPC | Mode | Lock | Category |
+|---|---|---|---|
+| `getFileInfo` | PATH_READ | FS | stat |
+| `getBlockLocations` | PATH_READ | GLOBAL | read |
+| `isFileClosed` | PATH_READ | FS | stat |
+| `getListing` | PATH_READ | FS | listing |
+| `getXAttrs` | PATH_READ | FS | xattr |
+| `listXAttrs` | PATH_READ | FS | xattr |
+| `getStoragePolicy` | PATH_READ | FS | attr |
+| `getPreferredBlockSize` | PATH_READ | FS | attr |
+| `getAclStatus` | PATH_READ | FS | ACL |
+| `getErasureCodingPolicy` | PATH_READ | FS | EC |
+| `checkAccess` | PATH_READ | FS | perm |
+| `create` (startFile) | PARENT_WRITE | FS | write |
+| `mkdirs` | PARENT_WRITE | FS | write |
+| `delete` (single-file) | PARENT_WRITE | GLOBAL | write |
+| `delete -r` (recursive) | ANCESTOR_WRITE | GLOBAL | write |
+| `setPermission` | PATH_WRITE | FS | attr |
+| `setOwner` | PATH_WRITE | FS | attr |
+| `setTimes` | PATH_WRITE | FS | attr |
+| `setReplication` | PATH_WRITE | GLOBAL | attr+BM |
+| `setStoragePolicy` | PATH_WRITE | FS | attr |
+| `unsetStoragePolicy` | PATH_WRITE | FS | attr |
+| `setAcl` | PATH_WRITE | FS | ACL |
+| `modifyAclEntries` | PATH_WRITE | FS | ACL |
+| `removeAclEntries` | PATH_WRITE | FS | ACL |
+| `removeDefaultAcl` | PATH_WRITE | FS | ACL |
+| `removeAcl` | PATH_WRITE | FS | ACL |
+| `setXAttr` | PATH_WRITE | FS | xattr |
+| `removeXAttr` | PATH_WRITE | FS | xattr |
+| `setErasureCodingPolicy` | PATH_WRITE | FS | EC |
+| `unsetErasureCodingPolicy` | PATH_WRITE | FS | EC |
+| `truncate` | PATH_WRITE | GLOBAL | write+BM+lease |
+| `append` | PATH_WRITE | GLOBAL | write+BM+lease |
+| `rename` | RENAME_WRITE | GLOBAL | write |
+
+**Unmigrated — feasible with existing modes (high priority):**
+
+| RPC | Candidate mode | Lock | Frequency | Notes |
+|---|---|---|---|---|
+| `completeFile` | PATH_WRITE + BM | GLOBAL | **very hot** — every file write | Closes file under construction; BM interaction |
+| `fsync` | PATH_WRITE | GLOBAL | **very hot** — every hflush | Updates last block length; edit log |
+| `getAdditionalBlock` | PATH_READ + BM (validate) then PATH_WRITE + BM (allocate) | GLOBAL | **very hot** — every block allocation | Two-phase: read-validate then write-allocate |
+| `abandonBlock` | PATH_WRITE + BM | GLOBAL | medium — on write failure | Removes a block from a file under construction |
+| `contentSummary` | PATH_READ | GLOBAL | **hot** — `hdfs dfs -count/-du` | Subtree walk; may be long-running under read lock |
+| `quotaUsage` | PATH_READ | GLOBAL | hot | Similar to contentSummary |
+| `createSymlink` | PARENT_WRITE | FS | low | Non-standard shape (no getPermissionChecker call) |
+| `satisfyStoragePolicy` | PATH_WRITE + BM + xattr | FS | low | Complex xattr + BM internals |
+| `recoverLease` | PATH_WRITE + lease | GLOBAL | low | Lease recovery |
+| `concat` | Custom multi-source | GLOBAL | low | Merges blocks from multiple source files |
+
+**Unmigrated — snapshot operations (out of pilot scope):**
+
+| RPC | Lock | Notes |
+|---|---|---|
+| `allowSnapshot` | FS | Admin: toggles snapshot feature |
+| `disallowSnapshot` | FS | Admin: removes snapshot feature |
+| `createSnapshot` | GLOBAL | Creates snapshot |
+| `deleteSnapshot` | GLOBAL | Deletes snapshot + block cleanup |
+| `renameSnapshot` | GLOBAL | Renames snapshot |
+| `computeSnapshotDiff` | FS | Read: computes diff between 2 snapshots |
+| `gcDeletedSnapshot` | GLOBAL | Admin: GCs deleted snapshots |
+| `ListSnapshot` | FS | Read: lists snapshots |
+| `listSnapshottableDirectory` | FS | Read: lists snapshottable dirs |
+
+**Unmigrated — admin / infrastructure (not path-based, use ADMIN_META or BM-only):**
+
+| RPC | Lock | Notes |
+|---|---|---|
+| `getDelegationToken` / `renewDelegationToken` / `cancelDelegationToken` | FS | Token ops; not namespace-path-based |
+| `addCacheDirective` / `modifyCacheDirective` / `removeCacheDirective` | GLOBAL | Cache management |
+| `addCachePool` / `modifyCachePool` / `removeCachePool` | GLOBAL | Cache pool admin |
+| `listCacheDirectives` / `listCachePools` | GLOBAL | Cache listing |
+| `addErasureCodingPolicies` / `enableErasureCodingPolicy` / `disableErasureCodingPolicy` / `removeErasureCodingPolicy` | FS | EC policy admin (not per-path) |
+| `getErasureCodingPolicies` / `getErasureCodingCodecs` / `getECTopologyResultForPolicies` | FS | EC policy listing |
+| `createEncryptionZone` / `listEncryptionZones` / `reencryptEncryptionZone` / `listReencryptionStatus` | GLOBAL/FS | EZ admin |
+| `rollEditLog` / `saveNamespace` | GLOBAL | Lifecycle |
+| `startRollingUpgrade` / `finalizeRollingUpgrade` / `queryRollingUpgrade` / `finalizeUpgrade` | GLOBAL/FS | Upgrade lifecycle |
+| `refreshNodes` / `metaSave` / `setBalancerBandwidth` | GLOBAL | Cluster admin |
+| `datanodeReport` / `slowDataNodesReport` / `listOpenFiles` / `listCorruptFileBlocks` | GLOBAL/FS | Monitoring |
+
 ### 1.5 Pilot envelope for `create`
 
 `IIPBasedFSNamesystemLock` handles a `create` request through the IIP path **only if all** of the following hold:
