@@ -3609,47 +3609,14 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     FSPermissionChecker.setOperationType(operationName);
     final String srcArg = src;
 
-    // HDFS-17385: PATH_WRITE + BM write for lease recovery.
-    PilotResult<Boolean> pr = tryPilot(
-        () -> canUsePilotPathWrite(srcArg),
-        () -> {
-          IIPBasedFSNamesystemLock iipLock =
-              (IIPBasedFSNamesystemLock) fsLock;
-          try (LockedIIP lip = iipLock.lockPath(srcArg,
-              IIPAcquireMode.PATH_WRITE)) {
-            checkOperation(OperationCategory.WRITE);
-            checkNameNodeSafeMode("Cannot recover the lease of " + srcArg);
-            INodesInPath iip = lip.iip();
-            if (iip.getLastINode() == null || !iip.getLastINode().isFile()) {
-              throw new PilotEnvelopeMissException(
-                  "recoverLease: target missing or not a file " + srcArg);
-            }
-            if (!ancestorsAllowMutate(iip)) {
-              throw new PilotEnvelopeMissException(
-                  "recoverLease: ancestor check " + srcArg);
-            }
-            final INodeFile inode = INodeFile.valueOf(
-                iip.getLastINode(), iip.getPath());
-            if (!inode.isUnderConstruction()) {
-              return true;
-            }
-            if (isPermissionEnabled) {
-              dir.checkPathAccess(pc, iip, FsAction.WRITE);
-            }
-            writeLock(RwLockMode.BM);
-            try {
-              return recoverLeaseInternal(RecoverLeaseOp.RECOVER_LEASE,
-                  iip, iip.getPath(), holder, clientMachine, true);
-            } finally {
-              writeUnlock(RwLockMode.BM, operationName);
-            }
-          }
-        }, operationName, srcArg);
-    if (pr.handled) {
-      getEditLog().logSync();
-      return pr.value;
-    }
-
+    // HDFS-17385: recoverLease intentionally NOT migrated to pilot.
+    // finalizeINodeFileUnderConstruction (called via recoverLeaseInternal
+    // → internalReleaseLease) has a torn-read window between
+    // toCompleteFile() and leaseManager.removeLease() that requires
+    // GLOBAL write lock exclusion against concurrent readers.
+    // HELD_IIP_WRITE makes the assertions pass but does not provide
+    // the actual mutual exclusion. recoverLease is low-frequency
+    // (lease recovery only); keeping it on GLOBAL lock is acceptable.
     writeLock(RwLockMode.GLOBAL);
     try {
       checkOperation(OperationCategory.WRITE);
