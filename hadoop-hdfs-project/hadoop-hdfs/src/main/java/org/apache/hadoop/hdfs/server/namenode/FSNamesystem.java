@@ -3884,20 +3884,54 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
   void abandonBlock(ExtendedBlock b, long fileId, String src, String holder)
       throws IOException {
     final String operationName = "abandonBlock";
-    NameNode.stateChangeLog.debug("BLOCK* NameSystem.abandonBlock: {} of file {}", b, src);
+    NameNode.stateChangeLog.debug(
+        "BLOCK* NameSystem.abandonBlock: {} of file {}", b, src);
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    writeLock(RwLockMode.GLOBAL);
-    try {
-      checkOperation(OperationCategory.WRITE);
-      checkNameNodeSafeMode("Cannot abandon block " + b + " for file" + src);
-      FSDirWriteFileOp.abandonBlock(dir, pc, b, fileId, src, holder);
-      NameNode.stateChangeLog.debug(
-          "BLOCK* NameSystem.abandonBlock: {} is removed from pendingCreates", b);
-    } finally {
-      writeUnlock(RwLockMode.GLOBAL, operationName);
+
+    PilotResult<Void> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> {
+          IIPBasedFSNamesystemLock iipLock =
+              (IIPBasedFSNamesystemLock) fsLock;
+          try (LockedIIP lip = iipLock.lockPath(src,
+              IIPAcquireMode.PATH_WRITE)) {
+            checkOperation(OperationCategory.WRITE);
+            checkNameNodeSafeMode(
+                "Cannot abandon block " + b + " for file" + src);
+            INodesInPath iip = lip.iip();
+            if (iip.getLastINode() == null || !iip.getLastINode().isFile()) {
+              throw new PilotEnvelopeMissException(
+                  "abandonBlock: target missing or not a file " + src);
+            }
+            if (!ancestorsAllowMutate(iip)) {
+              throw new PilotEnvelopeMissException(
+                  "abandonBlock: ancestor check " + src);
+            }
+            writeLock(RwLockMode.BM);
+            try {
+              FSDirWriteFileOp.abandonBlock(dir, pc, b, fileId, iip, holder);
+            } finally {
+              writeUnlock(RwLockMode.BM, operationName);
+            }
+            return null;
+          }
+        }, operationName, src);
+    if (!pr.handled) {
+      writeLock(RwLockMode.GLOBAL);
+      try {
+        checkOperation(OperationCategory.WRITE);
+        checkNameNodeSafeMode(
+            "Cannot abandon block " + b + " for file" + src);
+        FSDirWriteFileOp.abandonBlock(dir, pc, b, fileId, src, holder);
+      } finally {
+        writeUnlock(RwLockMode.GLOBAL, operationName);
+      }
     }
+    NameNode.stateChangeLog.debug(
+        "BLOCK* NameSystem.abandonBlock: {} is removed from pendingCreates",
+        b);
     getEditLog().logSync();
   }
 
@@ -3955,14 +3989,46 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    writeLock(RwLockMode.GLOBAL);
-    try {
-      checkOperation(OperationCategory.WRITE);
-      checkNameNodeSafeMode("Cannot complete file " + src);
-      success = FSDirWriteFileOp.completeFile(this, pc, src, holder, last,
-                                              fileId);
-    } finally {
-      writeUnlock(RwLockMode.GLOBAL, operationName);
+
+    PilotResult<Boolean> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> {
+          IIPBasedFSNamesystemLock iipLock =
+              (IIPBasedFSNamesystemLock) fsLock;
+          try (LockedIIP lip = iipLock.lockPath(src,
+              IIPAcquireMode.PATH_WRITE)) {
+            checkOperation(OperationCategory.WRITE);
+            checkNameNodeSafeMode("Cannot complete file " + src);
+            INodesInPath iip = lip.iip();
+            if (iip.getLastINode() == null || !iip.getLastINode().isFile()) {
+              throw new PilotEnvelopeMissException(
+                  "completeFile: target missing or not a file " + src);
+            }
+            if (!ancestorsAllowMutate(iip)) {
+              throw new PilotEnvelopeMissException(
+                  "completeFile: ancestor check " + src);
+            }
+            writeLock(RwLockMode.BM);
+            try {
+              return FSDirWriteFileOp.completeFile(this, pc, iip, holder,
+                  last, fileId);
+            } finally {
+              writeUnlock(RwLockMode.BM, operationName);
+            }
+          }
+        }, operationName, src);
+    if (pr.handled) {
+      success = pr.value;
+    } else {
+      writeLock(RwLockMode.GLOBAL);
+      try {
+        checkOperation(OperationCategory.WRITE);
+        checkNameNodeSafeMode("Cannot complete file " + src);
+        success = FSDirWriteFileOp.completeFile(this, pc, src, holder, last,
+                                                fileId);
+      } finally {
+        writeUnlock(RwLockMode.GLOBAL, operationName);
+      }
     }
     getEditLog().logSync();
     if (success) {
@@ -5095,20 +5161,52 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    writeLock(RwLockMode.GLOBAL);
-    try {
-      checkOperation(OperationCategory.WRITE);
-      checkNameNodeSafeMode("Cannot fsync file " + src);
-      INodesInPath iip = dir.resolvePath(pc, src, fileId);
-      src = iip.getPath();
-      final INodeFile pendingFile = checkLease(iip, clientName, fileId);
-      if (lastBlockLength > 0) {
-        pendingFile.getFileUnderConstructionFeature().updateLengthOfLastBlock(
-            pendingFile, lastBlockLength);
+    final String srcArg = src;
+
+    PilotResult<Void> pr = tryPilot(
+        () -> canUsePilotPathWrite(srcArg),
+        () -> {
+          IIPBasedFSNamesystemLock iipLock =
+              (IIPBasedFSNamesystemLock) fsLock;
+          try (LockedIIP lip = iipLock.lockPath(srcArg,
+              IIPAcquireMode.PATH_WRITE)) {
+            checkOperation(OperationCategory.WRITE);
+            checkNameNodeSafeMode("Cannot fsync file " + srcArg);
+            INodesInPath iip = lip.iip();
+            if (iip.getLastINode() == null || !iip.getLastINode().isFile()) {
+              throw new PilotEnvelopeMissException(
+                  "fsync: target missing or not a file " + srcArg);
+            }
+            if (!ancestorsAllowMutate(iip)) {
+              throw new PilotEnvelopeMissException(
+                  "fsync: ancestor check " + srcArg);
+            }
+            final INodeFile pendingFile = checkLease(iip, clientName, fileId);
+            if (lastBlockLength > 0) {
+              pendingFile.getFileUnderConstructionFeature()
+                  .updateLengthOfLastBlock(pendingFile, lastBlockLength);
+            }
+            FSDirWriteFileOp.persistBlocks(dir, iip.getPath(),
+                pendingFile, false);
+            return null;
+          }
+        }, operationName, srcArg);
+    if (!pr.handled) {
+      writeLock(RwLockMode.GLOBAL);
+      try {
+        checkOperation(OperationCategory.WRITE);
+        checkNameNodeSafeMode("Cannot fsync file " + src);
+        INodesInPath iip = dir.resolvePath(pc, src, fileId);
+        src = iip.getPath();
+        final INodeFile pendingFile = checkLease(iip, clientName, fileId);
+        if (lastBlockLength > 0) {
+          pendingFile.getFileUnderConstructionFeature()
+              .updateLengthOfLastBlock(pendingFile, lastBlockLength);
+        }
+        FSDirWriteFileOp.persistBlocks(dir, src, pendingFile, false);
+      } finally {
+        writeUnlock(RwLockMode.GLOBAL, operationName);
       }
-      FSDirWriteFileOp.persistBlocks(dir, src, pendingFile, false);
-    } finally {
-      writeUnlock(RwLockMode.GLOBAL, operationName);
     }
     getEditLog().logSync();
   }

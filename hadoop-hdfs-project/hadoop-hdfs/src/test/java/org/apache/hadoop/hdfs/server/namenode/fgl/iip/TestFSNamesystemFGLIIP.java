@@ -3269,6 +3269,102 @@ public class TestFSNamesystemFGLIIP {
       assertFalse(fs.exists(new Path("/pren/src" + t)));
     }
   }
-}
 
+  // ======================================================================
+  // Write-path hot RPCs: completeFile, fsync, abandonBlock.
+  // ======================================================================
+
+  /**
+   * completeFile: the full create→write→close cycle exercises the
+   * pilot for create (startFile), getBlockLocations, and now
+   * completeFile. If completeFile pilot fails, close() would hang.
+   */
+  @Test
+  @Timeout(60)
+  public void completeFileOnSimpleWrite() throws Exception {
+    Path p = new Path("/cf-simple");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[1024]);
+    }
+    // File is now closed via completeFile.
+    assertTrue(fs.isFileClosed(p));
+    assertEquals(1024, fs.getFileStatus(p).getLen());
+  }
+
+  /** completeFile with multiple blocks. */
+  @Test
+  @Timeout(60)
+  public void completeFileMultiBlock() throws Exception {
+    int blockSize = 512;
+    Path p = new Path("/cf-multi");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+        blockSize)) {
+      out.write(new byte[blockSize * 3]);
+    }
+    assertTrue(fs.isFileClosed(p));
+    assertEquals(blockSize * 3, fs.getFileStatus(p).getLen());
+  }
+
+  /** fsync (hflush) on an open file. */
+  @Test
+  @Timeout(60)
+  public void fsyncOnOpenFile() throws Exception {
+    Path p = new Path("/fsync-test");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[256]);
+      out.hflush();  // triggers fsync RPC
+      // File should still be open.
+      assertFalse(fs.isFileClosed(p));
+      // Data should be visible to readers after hflush.
+      assertTrue(fs.getFileStatus(p).getLen() >= 256);
+    }
+    assertTrue(fs.isFileClosed(p));
+  }
+
+  /** Parallel creates + writes + closes on disjoint files. */
+  @Test
+  @Timeout(120)
+  public void parallelWritePathDisjointFiles() throws Exception {
+    final int numThreads = 8;
+    final AtomicInteger errors = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            for (int i = 0; i < 5; i++) {
+              Path p = new Path("/pwp/t" + tid + "/f" + i);
+              fs.mkdirs(p.getParent());
+              try (FSDataOutputStream out = fs.create(p)) {
+                out.write(new byte[128]);
+                out.hflush();
+                out.write(new byte[128]);
+              }
+              if (fs.getFileStatus(p).getLen() != 256) {
+                errors.incrementAndGet();
+              }
+            }
+          } catch (Exception e) {
+            errors.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, errors.get());
+  }
+}
 

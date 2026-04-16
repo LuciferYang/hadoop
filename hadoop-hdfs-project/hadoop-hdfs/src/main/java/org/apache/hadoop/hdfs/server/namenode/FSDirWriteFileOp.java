@@ -140,6 +140,38 @@ class FSDirWriteFileOp {
     persistBlocks(fsd, src, file, false);
   }
 
+  /** FGL_IIP pilot overload of {@link #abandonBlock}. */
+  static void abandonBlock(
+      FSDirectory fsd, FSPermissionChecker pc, ExtendedBlock b, long fileId,
+      INodesInPath iip, String holder) throws IOException {
+    String src = iip.getPath();
+    FSNamesystem fsn = fsd.getFSNamesystem();
+    final INodeFile file = fsn.checkLease(iip, holder, fileId);
+    Preconditions.checkState(file.isUnderConstruction());
+    if (file.getBlockType() == BlockType.STRIPED) {
+      return;
+    }
+    Block localBlock = ExtendedBlock.getLocalBlock(b);
+    fsd.writeLock();
+    try {
+      if (!unprotectedRemoveBlock(fsd, src, iip, file, localBlock)) {
+        return;
+      }
+    } finally {
+      fsd.writeUnlock();
+    }
+    persistBlocks(fsd, src, file, false);
+  }
+
+  /** FGL_IIP pilot overload of {@link #completeFile}. */
+  static boolean completeFile(FSNamesystem fsn, FSPermissionChecker pc,
+      INodesInPath iip, String holder, ExtendedBlock last, long fileId)
+      throws IOException {
+    checkBlock(fsn, last);
+    return completeFileInternal(fsn, iip, holder,
+        ExtendedBlock.getLocalBlock(last), fileId);
+  }
+
   static void checkBlock(FSNamesystem fsn, ExtendedBlock block)
       throws IOException {
     String bpId = fsn.getBlockPoolId();
