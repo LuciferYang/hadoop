@@ -2533,19 +2533,53 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     FSPermissionChecker.setOperationType(operationName);
     checkOperation(OperationCategory.WRITE);
     String srcsStr = Arrays.toString(srcs);
-    try {
-      writeLock(RwLockMode.GLOBAL);
+
+    // HDFS-17385: PATH_WRITE on target. Concat requires that all
+    // source files are closed (not under construction), so their
+    // block structure is immutable — no per-INode lock needed on
+    // sources. Source paths are resolved inside FSDirConcatOp.concat
+    // under the held compat-read + fsd.writeLock.
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(target),
+        () -> {
+          IIPBasedFSNamesystemLock iipLock =
+              (IIPBasedFSNamesystemLock) fsLock;
+          try (LockedIIP lip = iipLock.lockPath(target,
+              IIPAcquireMode.PATH_WRITE)) {
+            checkOperation(OperationCategory.WRITE);
+            checkNameNodeSafeMode("Cannot concat " + target);
+            INodesInPath iip = lip.iip();
+            if (iip.getLastINode() == null
+                || !iip.getLastINode().isFile()) {
+              throw new PilotEnvelopeMissException(
+                  "concat: target missing or not a file " + target);
+            }
+            if (!ancestorsAllowMutate(iip)) {
+              throw new PilotEnvelopeMissException(
+                  "concat: ancestor check " + target);
+            }
+            return FSDirConcatOp.concat(dir, pc, target, srcs,
+                logRetryCache);
+          }
+        }, operationName, target);
+    if (pr.handled) {
+      stat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot concat " + target);
-        stat = FSDirConcatOp.concat(dir, pc, target, srcs, logRetryCache);
-      } finally {
-        writeUnlock(RwLockMode.GLOBAL, operationName,
-            getLockReportInfoSupplier(srcsStr, target, stat));
+        writeLock(RwLockMode.GLOBAL);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot concat " + target);
+          stat = FSDirConcatOp.concat(dir, pc, target, srcs,
+              logRetryCache);
+        } finally {
+          writeUnlock(RwLockMode.GLOBAL, operationName,
+              getLockReportInfoSupplier(srcsStr, target, stat));
+        }
+      } catch (AccessControlException ace) {
+        logAuditEvent(false, operationName, srcsStr, target, stat);
+        throw ace;
       }
-    } catch (AccessControlException ace) {
-      logAuditEvent(false, operationName, srcsStr, target, stat);
-      throw ace;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, srcsStr, target, stat);

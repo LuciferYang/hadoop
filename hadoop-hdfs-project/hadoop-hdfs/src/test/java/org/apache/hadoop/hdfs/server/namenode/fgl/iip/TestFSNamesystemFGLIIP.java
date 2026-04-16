@@ -3452,5 +3452,35 @@ public class TestFSNamesystemFGLIIP {
     org.apache.hadoop.fs.QuotaUsage qu = fs.getQuotaUsage(p);
     assertEquals(64, qu.getSpaceConsumed());
   }
+
+  // ======================================================================
+  // concat pilot (PATH_WRITE on target).
+  // ======================================================================
+
+  /** Concat two source files into a target. */
+  @Test
+  @Timeout(60)
+  public void concatTwoFiles() throws Exception {
+    int blockSize = 512;
+    Path target = new Path("/concat-target");
+    try (FSDataOutputStream out = fs.create(target, true, 4096,
+        (short) 1, blockSize)) {
+      out.write(new byte[blockSize]);
+    }
+    Path src1 = new Path("/concat-src1");
+    try (FSDataOutputStream out = fs.create(src1, true, 4096,
+        (short) 1, blockSize)) {
+      out.write(new byte[blockSize]);
+    }
+    Path src2 = new Path("/concat-src2");
+    try (FSDataOutputStream out = fs.create(src2, true, 4096,
+        (short) 1, blockSize)) {
+      out.write(new byte[blockSize]);
+    }
+    fs.concat(target, new Path[]{src1, src2});
+    assertEquals(blockSize * 3, fs.getFileStatus(target).getLen());
+    assertFalse(fs.exists(src1));
+    assertFalse(fs.exists(src2));
+  }
 }
 
