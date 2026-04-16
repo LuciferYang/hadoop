@@ -59,6 +59,28 @@ class FSDirAclOp {
     return fsd.getAuditFileInfo(iip);
   }
 
+  static FileStatus modifyAclEntries(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip,
+      List<AclEntry> aclSpec) throws IOException {
+    checkAclsConfigFlag(fsd);
+    fsd.writeLock();
+    try {
+      fsd.checkOwner(pc, iip);
+      INode inode = FSDirectory.resolveLastINode(iip);
+      int snapshotId = iip.getLatestSnapshotId();
+      List<AclEntry> existingAcl = AclStorage.readINodeLogicalAcl(inode);
+      List<AclEntry> newAcl = AclTransformation.mergeAclEntries(
+          existingAcl, aclSpec);
+      AclStorage.updateINodeAcl(inode, newAcl, snapshotId);
+      fsd.getEditLog().logSetAcl(iip.getPath(), newAcl);
+    } catch (AclException e) {
+      throw new AclException(e.getMessage() + " Path: " + iip.getPath(), e);
+    } finally {
+      fsd.writeUnlock();
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
   static FileStatus removeAclEntries(
       FSDirectory fsd, FSPermissionChecker pc, final String srcArg,
       List<AclEntry> aclSpec) throws IOException {
@@ -79,6 +101,28 @@ class FSDirAclOp {
       fsd.getEditLog().logSetAcl(src, newAcl);
     } catch (AclException e){
       throw new AclException(e.getMessage() + " Path: " + src, e);
+    } finally {
+      fsd.writeUnlock();
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
+  static FileStatus removeAclEntries(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip,
+      List<AclEntry> aclSpec) throws IOException {
+    checkAclsConfigFlag(fsd);
+    fsd.writeLock();
+    try {
+      fsd.checkOwner(pc, iip);
+      INode inode = FSDirectory.resolveLastINode(iip);
+      int snapshotId = iip.getLatestSnapshotId();
+      List<AclEntry> existingAcl = AclStorage.readINodeLogicalAcl(inode);
+      List<AclEntry> newAcl = AclTransformation.filterAclEntriesByAclSpec(
+          existingAcl, aclSpec);
+      AclStorage.updateINodeAcl(inode, newAcl, snapshotId);
+      fsd.getEditLog().logSetAcl(iip.getPath(), newAcl);
+    } catch (AclException e) {
+      throw new AclException(e.getMessage() + " Path: " + iip.getPath(), e);
     } finally {
       fsd.writeUnlock();
     }
@@ -110,6 +154,27 @@ class FSDirAclOp {
     return fsd.getAuditFileInfo(iip);
   }
 
+  static FileStatus removeDefaultAcl(FSDirectory fsd, FSPermissionChecker pc,
+      INodesInPath iip) throws IOException {
+    checkAclsConfigFlag(fsd);
+    fsd.writeLock();
+    try {
+      fsd.checkOwner(pc, iip);
+      INode inode = FSDirectory.resolveLastINode(iip);
+      int snapshotId = iip.getLatestSnapshotId();
+      List<AclEntry> existingAcl = AclStorage.readINodeLogicalAcl(inode);
+      List<AclEntry> newAcl = AclTransformation.filterDefaultAclEntries(
+          existingAcl);
+      AclStorage.updateINodeAcl(inode, newAcl, snapshotId);
+      fsd.getEditLog().logSetAcl(iip.getPath(), newAcl);
+    } catch (AclException e) {
+      throw new AclException(e.getMessage() + " Path: " + iip.getPath(), e);
+    } finally {
+      fsd.writeUnlock();
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
   static FileStatus removeAcl(FSDirectory fsd, FSPermissionChecker pc,
       final String srcArg) throws IOException {
     String src = srcArg;
@@ -127,6 +192,22 @@ class FSDirAclOp {
       fsd.writeUnlock();
     }
     fsd.getEditLog().logSetAcl(src, AclFeature.EMPTY_ENTRY_LIST);
+    return fsd.getAuditFileInfo(iip);
+  }
+
+  static FileStatus removeAcl(FSDirectory fsd, FSPermissionChecker pc,
+      INodesInPath iip) throws IOException {
+    checkAclsConfigFlag(fsd);
+    fsd.writeLock();
+    try {
+      fsd.checkOwner(pc, iip);
+      unprotectedRemoveAcl(fsd, iip);
+    } catch (AclException e) {
+      throw new AclException(e.getMessage() + " Path: " + iip.getPath(), e);
+    } finally {
+      fsd.writeUnlock();
+    }
+    fsd.getEditLog().logSetAcl(iip.getPath(), AclFeature.EMPTY_ENTRY_LIST);
     return fsd.getAuditFileInfo(iip);
   }
 

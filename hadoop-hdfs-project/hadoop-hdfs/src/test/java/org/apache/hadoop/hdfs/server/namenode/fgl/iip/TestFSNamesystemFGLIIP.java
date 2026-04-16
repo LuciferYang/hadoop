@@ -2746,6 +2746,88 @@ public class TestFSNamesystemFGLIIP {
       return null;
     });
   }
+
+  // ======================================================================
+  // modifyAclEntries / removeAclEntries / removeDefaultAcl / removeAcl
+  // pilot (RPCs #13–#16).
+  // ======================================================================
+
+  /** modifyAclEntries adds a named-user entry. */
+  @Test
+  @Timeout(60)
+  public void modifyAclEntriesAddsEntry() throws Exception {
+    Path p = new Path("/macl-add");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[4]);
+    }
+    java.util.List<org.apache.hadoop.fs.permission.AclEntry> spec =
+        org.apache.hadoop.fs.permission.AclEntry.parseAclSpec(
+            "user:alice:rwx", true);
+    fs.modifyAclEntries(p, spec);
+    org.apache.hadoop.fs.permission.AclStatus s = fs.getAclStatus(p);
+    assertTrue(s.getEntries().stream()
+        .anyMatch(e -> "alice".equals(e.getName())));
+  }
+
+  /** removeAclEntries removes the entry added above. */
+  @Test
+  @Timeout(60)
+  public void removeAclEntriesRemovesEntry() throws Exception {
+    Path p = new Path("/racl-rm");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[4]);
+    }
+    // Add then remove.
+    java.util.List<org.apache.hadoop.fs.permission.AclEntry> add =
+        org.apache.hadoop.fs.permission.AclEntry.parseAclSpec(
+            "user:bob:rwx", true);
+    fs.modifyAclEntries(p, add);
+    assertTrue(fs.getAclStatus(p).getEntries().stream()
+        .anyMatch(e -> "bob".equals(e.getName())));
+    java.util.List<org.apache.hadoop.fs.permission.AclEntry> rm =
+        org.apache.hadoop.fs.permission.AclEntry.parseAclSpec(
+            "user:bob:rwx", true);
+    fs.removeAclEntries(p, rm);
+    assertFalse(fs.getAclStatus(p).getEntries().stream()
+        .anyMatch(e -> "bob".equals(e.getName())));
+  }
+
+  /** removeDefaultAcl on a directory with default ACL. */
+  @Test
+  @Timeout(60)
+  public void removeDefaultAclOnDirectory() throws Exception {
+    Path dir = new Path("/rda-dir");
+    fs.mkdirs(dir);
+    java.util.List<org.apache.hadoop.fs.permission.AclEntry> acl =
+        org.apache.hadoop.fs.permission.AclEntry.parseAclSpec(
+            "user::rwx,group::r-x,other::---,default:user::rwx,"
+                + "default:group::r-x,default:other::---,default:user:x:rwx",
+            true);
+    fs.setAcl(dir, acl);
+    fs.removeDefaultAcl(dir);
+    org.apache.hadoop.fs.permission.AclStatus s = fs.getAclStatus(dir);
+    assertTrue(s.getEntries().stream()
+        .noneMatch(e -> e.getScope() ==
+            org.apache.hadoop.fs.permission.AclEntryScope.DEFAULT));
+  }
+
+  /** removeAcl removes all non-base ACL entries. */
+  @Test
+  @Timeout(60)
+  public void removeAclClearsAllExtendedEntries() throws Exception {
+    Path p = new Path("/rmacl-all");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[4]);
+    }
+    java.util.List<org.apache.hadoop.fs.permission.AclEntry> spec =
+        org.apache.hadoop.fs.permission.AclEntry.parseAclSpec(
+            "user:charlie:rwx", true);
+    fs.modifyAclEntries(p, spec);
+    assertTrue(fs.getAclStatus(p).getEntries().size() > 0,
+        "precondition: non-empty ACL");
+    fs.removeAcl(p);
+    assertEquals(0, fs.getAclStatus(p).getEntries().size());
+  }
 }
 
 

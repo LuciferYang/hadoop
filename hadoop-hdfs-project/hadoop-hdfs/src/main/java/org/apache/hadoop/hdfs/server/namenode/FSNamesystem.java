@@ -9256,19 +9256,28 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> aclPilot(src, pc, iip ->
+            FSDirAclOp.modifyAclEntries(dir, pc, iip, aclSpec)),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot modify ACL entries on " + src);
-        auditStat = FSDirAclOp.modifyAclEntries(dir, pc, src, aclSpec);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot modify ACL entries on " + src);
+          auditStat = FSDirAclOp.modifyAclEntries(dir, pc, src, aclSpec);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
@@ -9281,19 +9290,28 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     FileStatus auditStat = null;
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> aclPilot(src, pc, iip ->
+            FSDirAclOp.removeAclEntries(dir, pc, iip, aclSpec)),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot remove ACL entries on " + src);
-        auditStat = FSDirAclOp.removeAclEntries(dir, pc, src, aclSpec);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot remove ACL entries on " + src);
+          auditStat = FSDirAclOp.removeAclEntries(dir, pc, src, aclSpec);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
@@ -9305,19 +9323,28 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> aclPilot(src, pc, iip ->
+            FSDirAclOp.removeDefaultAcl(dir, pc, iip)),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot remove default ACL entries on " + src);
-        auditStat = FSDirAclOp.removeDefaultAcl(dir, pc, src);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot remove default ACL entries on " + src);
+          auditStat = FSDirAclOp.removeDefaultAcl(dir, pc, src);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
@@ -9329,22 +9356,62 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      writeLock(RwLockMode.FS);
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> aclPilot(src, pc, iip ->
+            FSDirAclOp.removeAcl(dir, pc, iip)),
+        operationName, src);
+    if (pr.handled) {
+      auditStat = pr.value;
+    } else {
       try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot remove ACL on " + src);
-        auditStat = FSDirAclOp.removeAcl(dir, pc, src);
-      } finally {
-        writeUnlock(RwLockMode.FS, operationName,
-            getLockReportInfoSupplier(src, null, auditStat));
+        writeLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot remove ACL on " + src);
+          auditStat = FSDirAclOp.removeAcl(dir, pc, src);
+        } finally {
+          writeUnlock(RwLockMode.FS, operationName,
+              getLockReportInfoSupplier(src, null, auditStat));
+        }
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, src, null, auditStat);
+  }
+
+  /**
+   * Shared pilot body for all 5 ACL RPCs (modifyAclEntries,
+   * removeAclEntries, removeDefaultAcl, removeAcl, setAcl). All use
+   * PATH_WRITE + checkOwner + ancestorsAllowMutate; the only
+   * difference is which {@code FSDirAclOp} method to call. The
+   * caller passes that as the {@code aclAction} lambda.
+   */
+  @FunctionalInterface
+  interface AclAction {
+    FileStatus apply(INodesInPath iip) throws IOException;
+  }
+
+  private FileStatus aclPilot(String src, FSPermissionChecker pc,
+      AclAction aclAction) throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot modify ACL on " + src);
+      INodesInPath iip = lip.iip();
+      if (iip.getLastINode() == null) {
+        throw new PilotEnvelopeMissException(
+            "ACL op: target does not exist " + src);
+      }
+      if (!ancestorsAllowMutate(iip)) {
+        throw new PilotEnvelopeMissException(
+            "ACL op: ancestor has snapshot/quota/storage-policy " + src);
+      }
+      return aclAction.apply(iip);
+    }
   }
 
   void setAcl(final String src, List<AclEntry> aclSpec) throws IOException {
@@ -9357,7 +9424,8 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     // HDFS-17385 Phase II pilot (post-gate): FGL_IIP PATH_WRITE path.
     PilotResult<FileStatus> pr = tryPilot(
         () -> canUsePilotPathWrite(src),
-        () -> setAclPilot(src, aclSpec, pc),
+        () -> aclPilot(src, pc, iip ->
+            FSDirAclOp.setAcl(dir, pc, iip, aclSpec)),
         operationName, src);
     if (pr.handled) {
       auditStat = pr.value;
@@ -9381,31 +9449,6 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     logAuditEvent(true, operationName, src, null, auditStat);
   }
 
-  /**
-   * FGL_IIP pilot for {@code setAcl}. PATH_WRITE on the target;
-   * permission requirement is owner (via {@code fsd.checkOwner}).
-   *
-   * @throws PilotEnvelopeMissException on Phase-B misses
-   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
-   */
-  private FileStatus setAclPilot(String src, List<AclEntry> aclSpec,
-      FSPermissionChecker pc) throws IOException, InterruptedException {
-    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
-    try (LockedIIP lip = iipLock.lockPath(src, IIPAcquireMode.PATH_WRITE)) {
-      checkOperation(OperationCategory.WRITE);
-      checkNameNodeSafeMode("Cannot set ACL on " + src);
-      INodesInPath iip = lip.iip();
-      if (iip.getLastINode() == null) {
-        throw new PilotEnvelopeMissException(
-            "setAcl: target does not exist " + src);
-      }
-      if (!ancestorsAllowMutate(iip)) {
-        throw new PilotEnvelopeMissException(
-            "setAcl: ancestor has snapshot/quota/storage-policy " + src);
-      }
-      return FSDirAclOp.setAcl(dir, pc, iip, aclSpec);
-    }
-  }
 
   AclStatus getAclStatus(String src) throws IOException {
     final String operationName = "getAclStatus";
