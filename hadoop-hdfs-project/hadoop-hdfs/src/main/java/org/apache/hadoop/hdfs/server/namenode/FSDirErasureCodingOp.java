@@ -237,6 +237,70 @@ final class FSDirErasureCodingOp {
     return fsd.getAuditFileInfo(iip);
   }
 
+  /** FGL_IIP pilot overload of {@link #setErasureCodingPolicy}. */
+  static FileStatus setErasureCodingPolicy(final FSNamesystem fsn,
+      final INodesInPath iip, final String ecPolicyName,
+      final FSPermissionChecker pc, final boolean logRetryCache)
+      throws IOException {
+    FSDirectory fsd = fsn.getFSDirectory();
+    List<XAttr> xAttrs;
+    fsd.writeLock();
+    try {
+      ErasureCodingPolicy ecPolicy = getEnabledErasureCodingPolicyByName(fsn,
+          ecPolicyName);
+      if (fsd.isPermissionEnabled()) {
+        fsd.checkPathAccess(pc, iip, FsAction.WRITE);
+      }
+      xAttrs = setErasureCodingPolicyXAttr(fsn, iip, ecPolicy);
+    } finally {
+      fsd.writeUnlock();
+    }
+    fsn.getEditLog().logSetXAttrs(iip.getPath(), xAttrs, logRetryCache);
+    return fsd.getAuditFileInfo(iip);
+  }
+
+  /** FGL_IIP pilot overload of {@link #unsetErasureCodingPolicy}. */
+  static FileStatus unsetErasureCodingPolicy(final FSNamesystem fsn,
+      final INodesInPath iip, final FSPermissionChecker pc,
+      final boolean logRetryCache) throws IOException {
+    FSDirectory fsd = fsn.getFSDirectory();
+    List<XAttr> xAttrs;
+    fsd.writeLock();
+    try {
+      if (fsd.isPermissionEnabled()) {
+        fsd.checkPathAccess(pc, iip, FsAction.WRITE);
+      }
+      xAttrs = removeErasureCodingPolicyXAttr(fsn, iip);
+    } finally {
+      fsd.writeUnlock();
+    }
+    if (xAttrs != null) {
+      fsn.getEditLog().logRemoveXAttrs(iip.getPath(), xAttrs, logRetryCache);
+    } else {
+      throw new NoECPolicySetException(
+          "No erasure coding policy explicitly set on " + iip.getPath());
+    }
+    return fsd.getAuditFileInfo(iip);
+  }
+
+  /** FGL_IIP pilot overload of {@link #getErasureCodingPolicy}. */
+  static ErasureCodingPolicy getErasureCodingPolicy(final FSNamesystem fsn,
+      final INodesInPath iip, FSPermissionChecker pc)
+      throws IOException {
+    if (fsn.isPermissionEnabled()) {
+      fsn.getFSDirectory().checkPathAccess(pc, iip, FsAction.READ);
+    }
+    if (iip.getLastINode() == null) {
+      throw new FileNotFoundException("Path not found: " + iip.getPath());
+    }
+    ErasureCodingPolicy ecPolicy = getErasureCodingPolicyForPath(
+        fsn.getFSDirectory(), iip);
+    if (ecPolicy != null && ecPolicy.isReplicationPolicy()) {
+      ecPolicy = null;
+    }
+    return ecPolicy;
+  }
+
   /**
    * Add an erasure coding policy.
    *

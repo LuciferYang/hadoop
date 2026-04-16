@@ -9706,18 +9706,30 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     FileStatus resultingStat = null;
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    writeLock(RwLockMode.FS);
-    try {
-      checkOperation(OperationCategory.WRITE);
-      checkNameNodeSafeMode("Cannot set erasure coding policy on " + srcArg);
-      resultingStat = FSDirErasureCodingOp.setErasureCodingPolicy(this,
-          srcArg, ecPolicyName, pc, logRetryCache);
-    } catch (AccessControlException ace) {
-      logAuditEvent(false, operationName, srcArg);
-      throw ace;
-    } finally {
-      writeUnlock(RwLockMode.FS, operationName,
-          getLockReportInfoSupplier(srcArg, null, resultingStat));
+
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(srcArg),
+        () -> xattrWritePilot(srcArg, pc, iip ->
+            FSDirErasureCodingOp.setErasureCodingPolicy(
+                this, iip, ecPolicyName, pc, logRetryCache)),
+        operationName, srcArg);
+    if (pr.handled) {
+      resultingStat = pr.value;
+    } else {
+      writeLock(RwLockMode.FS);
+      try {
+        checkOperation(OperationCategory.WRITE);
+        checkNameNodeSafeMode(
+            "Cannot set erasure coding policy on " + srcArg);
+        resultingStat = FSDirErasureCodingOp.setErasureCodingPolicy(this,
+            srcArg, ecPolicyName, pc, logRetryCache);
+      } catch (AccessControlException ace) {
+        logAuditEvent(false, operationName, srcArg);
+        throw ace;
+      } finally {
+        writeUnlock(RwLockMode.FS, operationName,
+            getLockReportInfoSupplier(srcArg, null, resultingStat));
+      }
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, srcArg, null, resultingStat);
@@ -9878,15 +9890,27 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     FileStatus resultingStat = null;
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    writeLock(RwLockMode.FS);
-    try {
-      checkOperation(OperationCategory.WRITE);
-      checkNameNodeSafeMode("Cannot unset erasure coding policy on " + srcArg);
-      resultingStat = FSDirErasureCodingOp.unsetErasureCodingPolicy(this,
-          srcArg, pc, logRetryCache);
-    } finally {
-      writeUnlock(RwLockMode.FS, operationName,
-          getLockReportInfoSupplier(srcArg, null, resultingStat));
+
+    PilotResult<FileStatus> pr = tryPilot(
+        () -> canUsePilotPathWrite(srcArg),
+        () -> xattrWritePilot(srcArg, pc, iip ->
+            FSDirErasureCodingOp.unsetErasureCodingPolicy(
+                this, iip, pc, logRetryCache)),
+        operationName, srcArg);
+    if (pr.handled) {
+      resultingStat = pr.value;
+    } else {
+      writeLock(RwLockMode.FS);
+      try {
+        checkOperation(OperationCategory.WRITE);
+        checkNameNodeSafeMode(
+            "Cannot unset erasure coding policy on " + srcArg);
+        resultingStat = FSDirErasureCodingOp.unsetErasureCodingPolicy(this,
+            srcArg, pc, logRetryCache);
+      } finally {
+        writeUnlock(RwLockMode.FS, operationName,
+            getLockReportInfoSupplier(srcArg, null, resultingStat));
+      }
     }
     getEditLog().logSync();
     logAuditEvent(true, operationName, srcArg, null, resultingStat);
@@ -9945,6 +9969,16 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkErasureCodingSupported(operationName);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
+
+    PilotResult<ErasureCodingPolicy> pr = tryPilot(
+        () -> canUsePilotPathRead(src),
+        () -> xattrReadPilot(src, pc, iip ->
+            FSDirErasureCodingOp.getErasureCodingPolicy(this, iip, pc)),
+        operationName, src);
+    if (pr.handled) {
+      logAuditEvent(true, operationName, src);
+      return pr.value;
+    }
     readLock(RwLockMode.FS);
     try {
       checkOperation(OperationCategory.READ);
@@ -10220,25 +10254,43 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     checkOperation(OperationCategory.READ);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
-    try {
-      readLock(RwLockMode.FS);
+    final String srcArg = src;
+
+    PilotResult<Void> pr = tryPilot(
+        () -> canUsePilotPathRead(srcArg),
+        () -> xattrReadPilot(srcArg, pc, iip -> {
+          INode inode = iip.getLastINode();
+          if (inode == null) {
+            throw new FileNotFoundException("Path not found: "
+                + iip.getPath());
+          }
+          if (isPermissionEnabled) {
+            dir.checkPathAccess(pc, iip, mode);
+          }
+          return null;
+        }),
+        operationName, src);
+    if (!pr.handled) {
       try {
-        checkOperation(OperationCategory.READ);
-        final INodesInPath iip = dir.resolvePath(pc, src, DirOp.READ);
-        src = iip.getPath();
-        INode inode = iip.getLastINode();
-        if (inode == null) {
-          throw new FileNotFoundException("Path not found: " + src);
+        readLock(RwLockMode.FS);
+        try {
+          checkOperation(OperationCategory.READ);
+          final INodesInPath iip = dir.resolvePath(pc, src, DirOp.READ);
+          src = iip.getPath();
+          INode inode = iip.getLastINode();
+          if (inode == null) {
+            throw new FileNotFoundException("Path not found: " + src);
+          }
+          if (isPermissionEnabled) {
+            dir.checkPathAccess(pc, iip, mode);
+          }
+        } finally {
+          readUnlock(RwLockMode.FS, operationName, getLockReportInfoSupplier(src));
         }
-        if (isPermissionEnabled) {
-          dir.checkPathAccess(pc, iip, mode);
-        }
-      } finally {
-        readUnlock(RwLockMode.FS, operationName, getLockReportInfoSupplier(src));
+      } catch (AccessControlException e) {
+        logAuditEvent(false, operationName, src);
+        throw e;
       }
-    } catch (AccessControlException e) {
-      logAuditEvent(false, operationName, src);
-      throw e;
     }
     logAuditEvent(true, operationName, src);
   }
