@@ -378,9 +378,12 @@ public class TestINodeLockManager {
 
   @Test
   @Timeout(10)
-  public void deferredModeThrowsUnsupported() {
-    assertThrows(UnsupportedOperationException.class,
-        () -> mgr.acquire("/a", IIPAcquireMode.RENAME_WRITE));
+  public void noDeferredModesRemain() {
+    // All 7 modes are pilot or fallback. This test ensures no
+    // accidental regression to DEFERRED.
+    for (IIPAcquireMode m : IIPAcquireMode.values()) {
+      assertFalse(m.isDeferred(), m + " should not be deferred");
+    }
   }
 
   @Test
@@ -458,7 +461,7 @@ public class TestINodeLockManager {
   @Timeout(10)
   public void unsupportedModeLeavesCompatLockUntouched() {
     assertThrows(UnsupportedOperationException.class,
-        () -> mgr.acquire("/a", IIPAcquireMode.RENAME_WRITE));
+        () -> mgr.acquire("/a", IIPAcquireMode.GLOBAL_READ));
     assertEquals(0, compat.getReadHoldCount(),
         "compat-read must not be acquired before mode validation");
     assertEquals(0, pool.size());

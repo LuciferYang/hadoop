@@ -3161,6 +3161,114 @@ public class TestFSNamesystemFGLIIP {
       assertFalse(fs.exists(new Path("/pdelr/t" + t)));
     }
   }
+
+  // ======================================================================
+  // rename pilot (RENAME_WRITE).
+  // ======================================================================
+
+  /** Happy path: rename a file within the same directory. */
+  @Test
+  @Timeout(60)
+  public void renameSameDirectory() throws Exception {
+    Path src = new Path("/ren-same/old");
+    fs.mkdirs(src.getParent());
+    try (FSDataOutputStream out = fs.create(src)) {
+      out.write(new byte[8]);
+    }
+    Path dst = new Path("/ren-same/new");
+    fs.rename(src, dst);
+    assertFalse(fs.exists(src));
+    assertTrue(fs.exists(dst));
+    assertEquals(8, fs.getFileStatus(dst).getLen());
+  }
+
+  /** Rename across different parent directories. */
+  @Test
+  @Timeout(60)
+  public void renameAcrossDirectories() throws Exception {
+    fs.mkdirs(new Path("/ren-cross/a"));
+    fs.mkdirs(new Path("/ren-cross/b"));
+    Path src = new Path("/ren-cross/a/file");
+    try (FSDataOutputStream out = fs.create(src)) {
+      out.write(new byte[16]);
+    }
+    Path dst = new Path("/ren-cross/b/file");
+    fs.rename(src, dst);
+    assertFalse(fs.exists(src));
+    assertTrue(fs.exists(dst));
+  }
+
+  /** Rename a directory (with contents). */
+  @Test
+  @Timeout(60)
+  public void renameDirectory() throws Exception {
+    Path src = new Path("/ren-dir/old");
+    fs.mkdirs(new Path(src, "sub"));
+    try (FSDataOutputStream out = fs.create(new Path(src, "sub/f"))) {
+      out.write(new byte[4]);
+    }
+    Path dst = new Path("/ren-dir/new");
+    fs.rename(src, dst);
+    assertFalse(fs.exists(src));
+    assertTrue(fs.exists(new Path(dst, "sub/f")));
+  }
+
+  /** Rename missing source fails. */
+  @Test
+  @Timeout(60)
+  public void renameMissingSourceFails() throws Exception {
+    fs.mkdirs(new Path("/ren-miss"));
+    // rename(src, dst) with missing src returns false in HDFS API
+    assertFalse(fs.rename(new Path("/ren-miss/no"), new Path("/ren-miss/x")));
+  }
+
+  /** Concurrent renames on disjoint source/dest pairs. */
+  @Test
+  @Timeout(120)
+  public void parallelRenameDisjointPairs() throws Exception {
+    final int numThreads = 8;
+    for (int t = 0; t < numThreads; t++) {
+      fs.mkdirs(new Path("/pren/src" + t));
+      try (FSDataOutputStream out = fs.create(
+          new Path("/pren/src" + t + "/file"))) {
+        out.write(new byte[4]);
+      }
+      fs.mkdirs(new Path("/pren/dst" + t));
+    }
+    final AtomicInteger failures = new AtomicInteger(0);
+    final CountDownLatch start = new CountDownLatch(1);
+
+    ExecutorService exec = Executors.newFixedThreadPool(numThreads);
+    try {
+      Future<?>[] futures = new Future<?>[numThreads];
+      for (int t = 0; t < numThreads; t++) {
+        final int tid = t;
+        futures[t] = exec.submit(() -> {
+          try {
+            start.await();
+            fs.rename(new Path("/pren/src" + tid),
+                new Path("/pren/dst" + tid + "/moved"));
+          } catch (Exception e) {
+            failures.incrementAndGet();
+            throw new RuntimeException(e);
+          }
+          return null;
+        });
+      }
+      start.countDown();
+      for (Future<?> f : futures) {
+        f.get(90, TimeUnit.SECONDS);
+      }
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(10, TimeUnit.SECONDS));
+    }
+    assertEquals(0, failures.get());
+    for (int t = 0; t < numThreads; t++) {
+      assertTrue(fs.exists(new Path("/pren/dst" + t + "/moved/file")));
+      assertFalse(fs.exists(new Path("/pren/src" + t)));
+    }
+  }
 }
 
 

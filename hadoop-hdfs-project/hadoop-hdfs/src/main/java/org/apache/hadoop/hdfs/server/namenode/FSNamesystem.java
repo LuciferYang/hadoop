@@ -121,7 +121,9 @@ import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfoStriped;
 import org.apache.hadoop.hdfs.server.namenode.fgl.FSNLockManager;
 import org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPAcquireMode;
 import org.apache.hadoop.hdfs.server.namenode.fgl.iip.IIPBasedFSNamesystemLock;
+import org.apache.hadoop.hdfs.server.namenode.fgl.iip.INodeLockManager;
 import org.apache.hadoop.hdfs.server.namenode.fgl.iip.LockedIIP;
+import org.apache.hadoop.hdfs.server.namenode.fgl.iip.LockedRenameIIPs;
 import org.apache.hadoop.hdfs.server.namenode.fgl.iip.PilotEnvelopeMissException;
 import org.apache.hadoop.thirdparty.com.google.common.collect.Maps;
 import org.apache.hadoop.hdfs.server.namenode.snapshot.SnapshotDeletionGc;
@@ -4067,16 +4069,27 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
     try {
-      writeLock(RwLockMode.GLOBAL);
-      try {
-        checkOperation(OperationCategory.WRITE);
-        checkNameNodeSafeMode("Cannot rename " + src);
-        res = FSDirRenameOp.renameToInt(dir, pc, src, dst, logRetryCache,
-            options);
-      } finally {
-        FileStatus status = res != null ? res.auditStat : null;
-        writeUnlock(RwLockMode.GLOBAL, operationName,
-            getLockReportInfoSupplier(src, dst, status));
+      // HDFS-17385 Phase II pilot: RENAME_WRITE — the last pilot mode.
+      // Two-path acquisition with parent write locks in ascending
+      // INode-ID order. Falls back to legacy on any envelope miss.
+      PilotResult<FSDirRenameOp.RenameResult> pr = tryPilot(
+          () -> canUsePilotParentWrite(src) && canUsePilotParentWrite(dst),
+          () -> renameToPilot(src, dst, pc, logRetryCache, options),
+          operationName, src);
+      if (pr.handled) {
+        res = pr.value;
+      } else {
+        writeLock(RwLockMode.GLOBAL);
+        try {
+          checkOperation(OperationCategory.WRITE);
+          checkNameNodeSafeMode("Cannot rename " + src);
+          res = FSDirRenameOp.renameToInt(dir, pc, src, dst, logRetryCache,
+              options);
+        } finally {
+          FileStatus status = res != null ? res.auditStat : null;
+          writeUnlock(RwLockMode.GLOBAL, operationName,
+              getLockReportInfoSupplier(src, dst, status));
+        }
       }
     } catch (AccessControlException e) {
       logAuditEvent(false, operationName + " (options=" +
@@ -4093,6 +4106,49 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
 
     logAuditEvent(true, operationName + " (options=" +
         Arrays.toString(options) + ")", src, dst, res.auditStat);
+  }
+
+  /**
+   * FGL_IIP pilot for rename. Uses the two-path
+   * {@code INodeLockManager.acquireRename} method which write-locks
+   * both parents in ascending INode-ID order (§1.8 rule 3). Delegates
+   * to {@link FSDirRenameOp#renameToInt} with pre-resolved IIPs.
+   */
+  private FSDirRenameOp.RenameResult renameToPilot(String src, String dst,
+      FSPermissionChecker pc, boolean logRetryCache,
+      Options.Rename... options)
+      throws IOException, InterruptedException {
+    IIPBasedFSNamesystemLock iipLock = (IIPBasedFSNamesystemLock) fsLock;
+    INodeLockManager lockMgr = iipLock.getLockManager();
+    try (LockedRenameIIPs lrip = lockMgr.acquireRename(src, dst)) {
+      checkOperation(OperationCategory.WRITE);
+      checkNameNodeSafeMode("Cannot rename " + src);
+
+      INodesInPath srcIIP = lrip.srcIIP();
+      INodesInPath dstIIP = lrip.dstIIP();
+
+      // Envelope: both parents must exist and pass the structural
+      // check. Source must exist.
+      INode srcParent = srcIIP.length() >= 2 ? srcIIP.getINode(-2) : null;
+      INode dstParent = dstIIP.length() >= 2 ? dstIIP.getINode(-2) : null;
+      if (srcParent == null || !srcParent.isDirectory()
+          || dstParent == null || !dstParent.isDirectory()) {
+        throw new PilotEnvelopeMissException(
+            "rename: parent missing or not directory " + src + " → " + dst);
+      }
+      if (!ancestorsAllowMutate(srcIIP) || !ancestorsAllowMutate(dstIIP)) {
+        throw new PilotEnvelopeMissException(
+            "rename: ancestor has snapshot/quota/storage-policy "
+                + src + " → " + dst);
+      }
+      if (srcIIP.getLastINode() == null) {
+        throw new PilotEnvelopeMissException(
+            "rename: source does not exist " + src);
+      }
+
+      return FSDirRenameOp.renameToInt(dir, pc, src, dst, logRetryCache,
+          options);
+    }
   }
 
   /**

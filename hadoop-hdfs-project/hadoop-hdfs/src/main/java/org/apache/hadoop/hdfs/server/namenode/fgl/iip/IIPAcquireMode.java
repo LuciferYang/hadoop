@@ -53,7 +53,7 @@ import org.apache.hadoop.classification.InterfaceAudience;
  *   <tr><td>{@link #ANCESTOR_WRITE}</td>
  *       <td>read (root → subtree root's parent)</td><td>subtree root: write; descendants: not locked</td><td>read</td><td>PILOT</td></tr>
  *   <tr><td>{@link #RENAME_WRITE}</td>
- *       <td>read on both paths</td><td>both parents: write in ascending-INode-ID order</td><td>read</td><td>DEFERRED</td></tr>
+ *       <td>read on both paths</td><td>both parents: write in ascending-INode-ID order</td><td>read</td><td>PILOT</td></tr>
  *   <tr><td>{@link #GLOBAL_READ}</td>
  *       <td>n/a</td><td>n/a</td><td>read</td><td>FALLBACK</td></tr>
  *   <tr><td>{@link #ADMIN_META}</td>
@@ -131,14 +131,16 @@ public enum IIPAcquireMode {
    */
   ANCESTOR_WRITE(Impl.PILOT),
 
-  // ========= Declared but deferred =========
-
   /**
-   * Write access to two parents for a rename operation. Acquires the two
-   * parent write locks in ascending-INode-ID order to prevent deadlock
-   * with a concurrent reverse rename. See §1.8 rule 3 of the pilot spec.
+   * Write access to two parents for a rename operation. Acquires read
+   * locks on ancestors of both source and destination paths, then
+   * write-locks both parents in ascending-INode-ID order to prevent
+   * deadlock with a concurrent reverse rename (§1.8 rule 3).
+   * Implemented via {@code INodeLockManager.acquireRename} — a
+   * dedicated two-path acquisition method that returns a
+   * {@link LockedRenameIIPs} instead of a single {@link LockedIIP}.
    */
-  RENAME_WRITE(Impl.DEFERRED);
+  RENAME_WRITE(Impl.PILOT);
 
   // -----------------------------------------------------------------
 

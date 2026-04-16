@@ -398,6 +398,178 @@ public final class INodeLockManager {
   }
 
   /**
+   * Two-path acquisition for rename. Acquires read locks on
+   * ancestors of both paths, then write-locks both parents in
+   * ascending INode-ID order (§1.8 rule 3) to prevent deadlock
+   * with a concurrent reverse rename.
+   *
+   * <p>Returns {@link LockedRenameIIPs} carrying both pre-resolved
+   * IIPs. Targets (one level below each parent) are populated
+   * without locking — protected by the parents' write locks.
+   *
+   * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §1.4, §1.8
+   */
+  public LockedRenameIIPs acquireRename(String srcPath, String dstPath)
+      throws IOException, InterruptedException {
+    return acquireRename(srcPath, dstPath, defaultTimeout);
+  }
+
+  /**
+   * Same as {@link #acquireRename(String, String)} with custom timeout.
+   */
+  public LockedRenameIIPs acquireRename(String srcPath, String dstPath,
+      Duration timeout) throws IOException, InterruptedException {
+    if (srcPath == null || dstPath == null) {
+      throw new IllegalArgumentException("rename paths must not be null");
+    }
+    if (HELD_IIP_DEPTH.get() > 0) {
+      throw new IllegalStateException("nested IIP acquisition forbidden");
+    }
+    assert !compatLock.isWriteLockedByCurrentThread()
+        : "compat-write held at rename acquire — violates rule 5";
+
+    byte[][] srcComponents = INode.getPathComponents(srcPath);
+    byte[][] dstComponents = INode.getPathComponents(dstPath);
+    if (srcComponents == null || srcComponents.length < 2) {
+      throw new InvalidPathException("rename src requires non-root: " + srcPath);
+    }
+    if (dstComponents == null || dstComponents.length < 2) {
+      throw new InvalidPathException("rename dst requires non-root: " + dstPath);
+    }
+
+    long deadlineNanos = computeDeadlineNanos(timeout);
+
+    // Phase 1: compat-read
+    long remaining = deadlineNanos - System.nanoTime();
+    if (remaining <= 0L || !compatLock.readLock().tryLock(
+        remaining, TimeUnit.NANOSECONDS)) {
+      throw new LockAcquisitionTimeoutException("timed out for rename");
+    }
+
+    List<LockRef> held = new ArrayList<>();
+    boolean success = false;
+    try {
+      INode root = rootSupplier.get();
+      if (root == null) {
+        throw new IllegalStateException("rootSupplier returned null");
+      }
+
+      // Walk src ancestors (read-lock root through src-parent's parent)
+      INode[] srcInodes = new INode[srcComponents.length];
+      int srcParentDepth = srcComponents.length - 2;
+      walkAncestors(root, srcComponents, srcInodes, held, deadlineNanos,
+          srcParentDepth - 1);
+
+      // Walk dst ancestors (read-lock root through dst-parent's parent)
+      INode[] dstInodes = new INode[dstComponents.length];
+      int dstParentDepth = dstComponents.length - 2;
+      walkAncestors(root, dstComponents, dstInodes, held, deadlineNanos,
+          dstParentDepth - 1);
+
+      // Discover parents (unlocked) via getChild on the last locked
+      // ancestor.
+      discoverParent(srcComponents, srcInodes, srcParentDepth);
+      discoverParent(dstComponents, dstInodes, dstParentDepth);
+
+      INode srcParent = srcInodes[srcParentDepth];
+      INode dstParent = dstInodes[dstParentDepth];
+
+      // Write-lock both parents in ascending INode-ID order (rule 3).
+      if (srcParent != null && dstParent != null) {
+        if (srcParent.getId() == dstParent.getId()) {
+          // Same parent (rename within same dir)
+          held.add(LockRef.acquire(pool, srcParent.getId(), true,
+              deadlineNanos));
+        } else if (srcParent.getId() < dstParent.getId()) {
+          held.add(LockRef.acquire(pool, srcParent.getId(), true,
+              deadlineNanos));
+          held.add(LockRef.acquire(pool, dstParent.getId(), true,
+              deadlineNanos));
+        } else {
+          held.add(LockRef.acquire(pool, dstParent.getId(), true,
+              deadlineNanos));
+          held.add(LockRef.acquire(pool, srcParent.getId(), true,
+              deadlineNanos));
+        }
+      }
+
+      // Populate targets (unlocked, protected by parent write locks)
+      discoverTarget(srcComponents, srcInodes, srcParentDepth);
+      discoverTarget(dstComponents, dstInodes, dstParentDepth);
+
+      INodesInPath srcIIP = INodesInPath.fromComponentsAndInodes(
+          srcComponents, srcInodes);
+      INodesInPath dstIIP = INodesInPath.fromComponentsAndInodes(
+          dstComponents, dstInodes);
+
+      LockedRenameIIPs result = new LockedRenameIIPs(srcIIP, dstIIP,
+          Collections.unmodifiableList(new ArrayList<>(held)),
+          compatLock.readLock());
+      HELD_IIP_DEPTH.set(1);
+      HELD_IIP_WRITE.set(Boolean.TRUE);
+      success = true;
+      return result;
+    } finally {
+      if (!success) {
+        for (int i = held.size() - 1; i >= 0; i--) {
+          try { held.get(i).close(); } catch (RuntimeException ignored) {}
+        }
+        compatLock.readLock().unlock();
+      }
+    }
+  }
+
+  /**
+   * Walk and read-lock ancestors from root to {@code maxDepth}
+   * inclusive. Used by {@link #acquireRename}.
+   */
+  private void walkAncestors(INode root, byte[][] components,
+      INode[] inodes, List<LockRef> held, long deadlineNanos,
+      int maxDepth) throws IOException, InterruptedException {
+    INode current = root;
+    for (int depth = 0; depth <= maxDepth && current != null; depth++) {
+      if (current.isReference()) {
+        throw new PilotEnvelopeMissException(
+            "INodeReference in rename ancestor at depth " + depth);
+      }
+      if (current instanceof INodeSymlink && depth < components.length - 1) {
+        throw new PilotEnvelopeMissException(
+            "symlink in rename ancestor at depth " + depth);
+      }
+      held.add(LockRef.acquire(pool, current.getId(), false,
+          deadlineNanos));
+      inodes[depth] = current;
+      if (depth < maxDepth && current.isDirectory()) {
+        current = current.asDirectory().getChild(
+            components[depth + 1], Snapshot.CURRENT_STATE_ID);
+      }
+    }
+  }
+
+  /** Discover the parent INode without locking it. */
+  private void discoverParent(byte[][] components, INode[] inodes,
+      int parentDepth) {
+    int grandparentDepth = parentDepth - 1;
+    if (grandparentDepth >= 0 && inodes[grandparentDepth] != null
+        && inodes[grandparentDepth].isDirectory()) {
+      inodes[parentDepth] = inodes[grandparentDepth].asDirectory()
+          .getChild(components[parentDepth], Snapshot.CURRENT_STATE_ID);
+    }
+  }
+
+  /** Discover the target INode (one level below parent) without locking. */
+  private void discoverTarget(byte[][] components, INode[] inodes,
+      int parentDepth) {
+    int targetDepth = parentDepth + 1;
+    if (targetDepth < components.length
+        && inodes[parentDepth] != null
+        && inodes[parentDepth].isDirectory()) {
+      inodes[targetDepth] = inodes[parentDepth].asDirectory()
+          .getChild(components[targetDepth], Snapshot.CURRENT_STATE_ID);
+    }
+  }
+
+  /**
    * Sentinel returned by {@link #computeMaxLockDepth} when the
    * requested mode is invalid for a given path length (e.g.,
    * PARENT_WRITE or PATH_WRITE on the root "/").

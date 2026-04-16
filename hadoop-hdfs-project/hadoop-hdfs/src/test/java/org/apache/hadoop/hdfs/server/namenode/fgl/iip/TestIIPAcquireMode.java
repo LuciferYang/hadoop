@@ -44,7 +44,8 @@ public class TestIIPAcquireMode {
       EnumSet.of(IIPAcquireMode.PATH_READ,
           IIPAcquireMode.PARENT_WRITE,
           IIPAcquireMode.PATH_WRITE,
-          IIPAcquireMode.ANCESTOR_WRITE);
+          IIPAcquireMode.ANCESTOR_WRITE,
+          IIPAcquireMode.RENAME_WRITE);
 
   /** Expected fallback modes. Change with intent. */
   private static final Set<IIPAcquireMode> FALLBACK_MODES =
@@ -52,7 +53,7 @@ public class TestIIPAcquireMode {
 
   /** Expected deferred modes. Change with intent. */
   private static final Set<IIPAcquireMode> DEFERRED_MODES =
-      EnumSet.of(IIPAcquireMode.RENAME_WRITE);
+      EnumSet.noneOf(IIPAcquireMode.class);
 
   /** Modes that take some per-INode write lock. */
   private static final Set<IIPAcquireMode> IIP_WRITE_MODES =
@@ -153,22 +154,20 @@ public class TestIIPAcquireMode {
   }
 
   @Test
-  public void pilotExercisesThreeWriteModes() {
-    // Pilot modes: PATH_READ (no write) + PARENT_WRITE (parent write)
-    // + PATH_WRITE (target write) + ANCESTOR_WRITE (subtree root
-    // write). The pilot exercises three write patterns.
+  public void pilotExercisesFourWriteModes() {
+    // All four write modes are now pilot-implemented.
     long pilotWrites = PILOT_MODES.stream()
         .filter(IIPAcquireMode::needsIIPWrite)
         .count();
-    assertEquals(3, pilotWrites,
-        "pilot exercises exactly three IIP write patterns "
-            + "(PARENT_WRITE, PATH_WRITE, ANCESTOR_WRITE)");
+    assertEquals(4, pilotWrites,
+        "pilot exercises all four IIP write patterns "
+            + "(PARENT_WRITE, PATH_WRITE, ANCESTOR_WRITE, RENAME_WRITE)");
   }
 
   @Test
   public void deferredModeSetMatchesSpec() {
-    // RENAME_WRITE is the only remaining deferred mode.
-    assertEquals(EnumSet.of(IIPAcquireMode.RENAME_WRITE),
+    // No deferred modes remain — all 7 modes are implemented.
+    assertEquals(EnumSet.noneOf(IIPAcquireMode.class),
         EnumSet.allOf(IIPAcquireMode.class).stream()
             .filter(IIPAcquireMode::isDeferred)
             .collect(java.util.stream.Collectors.toCollection(

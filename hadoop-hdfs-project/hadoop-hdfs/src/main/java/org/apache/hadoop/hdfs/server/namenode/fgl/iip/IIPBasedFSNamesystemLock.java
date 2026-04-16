@@ -186,6 +186,15 @@ public class IIPBasedFSNamesystemLock implements FSNLockManager {
     return inodeLockManager.acquire(path, mode);
   }
 
+  /**
+   * Exposes the lock manager for the two-path
+   * {@link INodeLockManager#acquireRename} method. Single-path
+   * callers should use {@link #lockPath} instead.
+   */
+  public INodeLockManager getLockManager() {
+    return inodeLockManager;
+  }
+
   // ================================================================
   // hasWriteLock / hasReadLock overrides (P4 from the pilot design)
   // ================================================================
