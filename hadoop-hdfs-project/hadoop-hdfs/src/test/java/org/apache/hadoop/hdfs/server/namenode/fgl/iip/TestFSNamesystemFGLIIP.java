@@ -3366,5 +3366,91 @@ public class TestFSNamesystemFGLIIP {
     }
     assertEquals(0, errors.get());
   }
+
+  // ======================================================================
+  // getAdditionalBlock, contentSummary, quotaUsage.
+  // ======================================================================
+
+  /**
+   * getAdditionalBlock is exercised implicitly by every multi-block
+   * write. This test creates a file larger than one block to force
+   * at least one addBlock call through the pilot.
+   */
+  @Test
+  @Timeout(60)
+  public void getAdditionalBlockViaMultiBlockWrite() throws Exception {
+    int blockSize = 512;
+    Path p = new Path("/gab-multi");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+        blockSize)) {
+      // Write 3 blocks worth of data → 2 addBlock calls.
+      out.write(new byte[blockSize * 3]);
+    }
+    assertEquals(blockSize * 3, fs.getFileStatus(p).getLen());
+    LocatedBlocks lbs = fs.getClient().getLocatedBlocks(
+        p.toString(), 0L, Long.MAX_VALUE);
+    assertEquals(3, lbs.getLocatedBlocks().size());
+  }
+
+  /** contentSummary on a directory with files. */
+  @Test
+  @Timeout(60)
+  public void contentSummaryOnDirectory() throws Exception {
+    Path dir = new Path("/cs-dir");
+    fs.mkdirs(dir);
+    for (int i = 0; i < 3; i++) {
+      try (FSDataOutputStream out = fs.create(
+          new Path(dir, "f" + i), true, 4096, (short) 1, 4096)) {
+        out.write(new byte[100]);
+      }
+    }
+    org.apache.hadoop.fs.ContentSummary cs = fs.getContentSummary(dir);
+    assertEquals(3, cs.getFileCount());
+    assertEquals(1, cs.getDirectoryCount());
+    assertTrue(cs.getLength() >= 300);
+  }
+
+  /** contentSummary on a single file. */
+  @Test
+  @Timeout(60)
+  public void contentSummaryOnFile() throws Exception {
+    Path p = new Path("/cs-file");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[256]);
+    }
+    org.apache.hadoop.fs.ContentSummary cs = fs.getContentSummary(p);
+    assertEquals(1, cs.getFileCount());
+    assertEquals(0, cs.getDirectoryCount());
+    assertEquals(256, cs.getLength());
+  }
+
+  /** quotaUsage on a directory with namespace quota. */
+  @Test
+  @Timeout(60)
+  public void quotaUsageOnDirectoryWithQuota() throws Exception {
+    Path dir = new Path("/qu-dir");
+    fs.mkdirs(dir);
+    fs.setQuota(dir, 100L, HdfsConstants.QUOTA_DONT_SET);
+    try (FSDataOutputStream out = fs.create(
+        new Path(dir, "file"), true, 4096, (short) 1, 4096)) {
+      out.write(new byte[50]);
+    }
+    org.apache.hadoop.fs.QuotaUsage qu =
+        fs.getQuotaUsage(dir);
+    assertEquals(100L, qu.getQuota());
+    assertTrue(qu.getFileAndDirectoryCount() >= 2);
+  }
+
+  /** quotaUsage on a path without quota falls back to contentSummary. */
+  @Test
+  @Timeout(60)
+  public void quotaUsageOnPathWithoutQuota() throws Exception {
+    Path p = new Path("/qu-noquota");
+    try (FSDataOutputStream out = fs.create(p)) {
+      out.write(new byte[64]);
+    }
+    org.apache.hadoop.fs.QuotaUsage qu = fs.getQuotaUsage(p);
+    assertEquals(64, qu.getSpaceConsumed());
+  }
 }
 

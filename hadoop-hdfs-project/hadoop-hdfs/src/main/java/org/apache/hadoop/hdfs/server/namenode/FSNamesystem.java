@@ -3776,14 +3776,70 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       DatanodeInfo[] excludedNodes, String[] favoredNodes,
       EnumSet<AddBlockFlag> flags) throws IOException {
     final String operationName = "getAdditionalBlock";
-    NameNode.stateChangeLog.debug("BLOCK* getAdditionalBlock: {}  inodeId {} for {}",
+    NameNode.stateChangeLog.debug(
+        "BLOCK* getAdditionalBlock: {}  inodeId {} for {}",
         src, fileId, clientName);
 
-    LocatedBlock[] onRetryBlock = new LocatedBlock[1];
-    FSDirWriteFileOp.ValidateAddBlockResult r;
     checkOperation(OperationCategory.WRITE);
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
+
+    // HDFS-17385 Phase II pilot: PATH_WRITE + BM write for the
+    // entire validate → chooseTarget → store cycle. Legacy splits
+    // this into readLock(validate) → unlock → chooseTarget →
+    // writeLock(store). Pilot holds PATH_WRITE continuously; the
+    // file is under construction so the wider critical section
+    // only affects the single active writer.
+    PilotResult<LocatedBlock> pr = tryPilot(
+        () -> canUsePilotPathWrite(src),
+        () -> {
+          IIPBasedFSNamesystemLock iipLock =
+              (IIPBasedFSNamesystemLock) fsLock;
+          try (LockedIIP lip = iipLock.lockPath(src,
+              IIPAcquireMode.PATH_WRITE)) {
+            checkOperation(OperationCategory.WRITE);
+            INodesInPath iip = lip.iip();
+            if (iip.getLastINode() == null
+                || !iip.getLastINode().isFile()) {
+              throw new PilotEnvelopeMissException(
+                  "getAdditionalBlock: target missing or not a file " + src);
+            }
+            if (!ancestorsAllowMutate(iip)) {
+              throw new PilotEnvelopeMissException(
+                  "getAdditionalBlock: ancestor check " + src);
+            }
+            writeLock(RwLockMode.BM);
+            try {
+              // Phase 1: validate
+              LocatedBlock[] onRetryBlock = new LocatedBlock[1];
+              FSDirWriteFileOp.ValidateAddBlockResult r =
+                  FSDirWriteFileOp.validateAddBlock(this, pc, src, fileId,
+                      clientName, previous, onRetryBlock);
+              if (r == null) {
+                return onRetryBlock[0];
+              }
+              // Phase 2: choose targets (in-memory BM computation)
+              DatanodeStorageInfo[] targets =
+                  FSDirWriteFileOp.chooseTargetForNewBlock(
+                      blockManager, src, excludedNodes, favoredNodes,
+                      flags, r);
+              // Phase 3: store
+              checkOperation(OperationCategory.WRITE);
+              return FSDirWriteFileOp.storeAllocatedBlock(
+                  this, src, fileId, clientName, previous, targets);
+            } finally {
+              writeUnlock(RwLockMode.BM, operationName);
+            }
+          }
+        }, operationName, src);
+    if (pr.handled) {
+      getEditLog().logSync();
+      return pr.value;
+    }
+
+    // Legacy path (unchanged)
+    LocatedBlock[] onRetryBlock = new LocatedBlock[1];
+    FSDirWriteFileOp.ValidateAddBlockResult r;
     readLock(RwLockMode.GLOBAL);
     try {
       checkOperation(OperationCategory.WRITE);
@@ -3792,16 +3848,12 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     } finally {
       readUnlock(RwLockMode.GLOBAL, operationName);
     }
-
     if (r == null) {
       assert onRetryBlock[0] != null : "Retry block is null";
-      // This is a retry. Just return the last block.
       return onRetryBlock[0];
     }
-
     DatanodeStorageInfo[] targets = FSDirWriteFileOp.chooseTargetForNewBlock(
         blockManager, src, excludedNodes, favoredNodes, flags, r);
-
     checkOperation(OperationCategory.WRITE);
     writeLock(RwLockMode.GLOBAL);
     LocatedBlock lb;
@@ -5052,6 +5104,16 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     ContentSummary cs;
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
+
+    PilotResult<ContentSummary> pr = tryPilot(
+        () -> canUsePilotPathRead(src),
+        () -> xattrReadPilot(src, pc, iip ->
+            FSDirStatAndListingOp.getContentSummary(dir, pc, iip)),
+        operationName, src);
+    if (pr.handled) {
+      logAuditEvent(true, operationName, src);
+      return pr.value;
+    }
     try {
       readLock(RwLockMode.GLOBAL);
       try {
@@ -5088,6 +5150,16 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
     QuotaUsage quotaUsage;
     final FSPermissionChecker pc = getPermissionChecker();
     FSPermissionChecker.setOperationType(operationName);
+
+    PilotResult<QuotaUsage> pr = tryPilot(
+        () -> canUsePilotPathRead(src),
+        () -> xattrReadPilot(src, pc, iip ->
+            FSDirStatAndListingOp.getQuotaUsage(dir, pc, iip)),
+        operationName, src);
+    if (pr.handled) {
+      logAuditEvent(true, operationName, src);
+      return pr.value;
+    }
     try {
       readLock(RwLockMode.GLOBAL);
       try {

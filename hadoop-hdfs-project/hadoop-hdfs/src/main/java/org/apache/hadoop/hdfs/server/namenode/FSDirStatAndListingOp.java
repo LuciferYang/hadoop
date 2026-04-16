@@ -174,6 +174,33 @@ class FSDirStatAndListingOp {
     return getContentSummaryInt(fsd, pc, iip);
   }
 
+  /** FGL_IIP pilot overload. */
+  static ContentSummary getContentSummary(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip)
+      throws IOException {
+    if (fsd.isPermissionEnabled() && fsd.isPermissionContentSummarySubAccess()) {
+      fsd.checkPermission(pc, iip, false, null, null, null,
+          FsAction.READ_EXECUTE);
+      pc = null;
+    }
+    return getContentSummaryInt(fsd, pc, iip);
+  }
+
+  /** FGL_IIP pilot overload. */
+  static QuotaUsage getQuotaUsage(
+      FSDirectory fsd, FSPermissionChecker pc, INodesInPath iip)
+      throws IOException {
+    if (fsd.isPermissionEnabled()) {
+      fsd.checkPermission(pc, iip, false, null, null, null,
+          FsAction.READ_EXECUTE);
+    }
+    QuotaUsage usage = getQuotaUsageInt(fsd, iip);
+    if (usage != null) {
+      return usage;
+    }
+    return getContentSummaryInt(fsd, pc, iip);
+  }
+
   /**
    * Get block locations within the specified range.
    * @see ClientProtocol#getBlockLocations(String, long, long)
