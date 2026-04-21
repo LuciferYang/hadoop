@@ -996,7 +996,7 @@ public class INodeFile extends INodeWithAdditionalFields
     //check if the last block is BlockInfoUnderConstruction
     BlockInfo lastBlk = blocks[last];
     long size = lastBlk.getNumBytes();
-    if (!lastBlk.isComplete()) {
+    if (lastBlk.isUnderConstructionOrRecovery()) {
        if (!includesLastUcBlock) {
          size = 0;
        } else if (usePreferredBlockSize4LastUcBlock) {
@@ -1031,7 +1031,7 @@ public class INodeFile extends INodeWithAdditionalFields
     QuotaCounts counts = new QuotaCounts.Builder().build();
     for (BlockInfo b : blocks) {
       Preconditions.checkState(b.isStriped());
-      long blockSize = b.isComplete() ?
+      long blockSize = !b.isUnderConstructionOrRecovery() ?
           ((BlockInfoStriped)b).spaceConsumed() : getPreferredBlockSize() *
           ((BlockInfoStriped)b).getTotalBlockNum();
       counts.addStorageSpace(blockSize);
@@ -1061,8 +1061,8 @@ public class INodeFile extends INodeWithAdditionalFields
 
     final short replication = getPreferredBlockReplication();
     for (BlockInfo b : blocks) {
-      long blockSize = b.isComplete() ? b.getNumBytes() :
-          getPreferredBlockSize();
+      long blockSize = b.isUnderConstructionOrRecovery() ?
+          getPreferredBlockSize() : b.getNumBytes();
       counts.addStorageSpace(blockSize * replication);
       if (bsp != null) {
         List<StorageType> types = bsp.chooseStorageTypes(replication);

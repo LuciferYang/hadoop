@@ -5567,7 +5567,11 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       final Block commitBlock) throws IOException {
     assert hasWriteLock(RwLockMode.GLOBAL);
     Preconditions.checkArgument(fileINode.isUnderConstruction());
-    blockManager.commitOrCompleteLastBlock(fileINode, commitBlock, iip);
+    if (!blockManager.commitOrCompleteLastBlock(fileINode, commitBlock)) {
+      return;
+    }
+    // Updating QuotaUsage when committing block since block size will not be changed
+    getFSDirectory().updateSpaceForCommittedBlock(commitBlock, iip);
   }
 
   void addCommittedBlocksToPending(final INodeFile pendingFile) {
