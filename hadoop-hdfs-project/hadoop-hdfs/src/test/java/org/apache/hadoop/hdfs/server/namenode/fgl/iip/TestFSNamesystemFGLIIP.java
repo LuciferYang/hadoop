@@ -43,10 +43,13 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.fs.DirectoryListingStartAfterNotFoundException;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
+import org.apache.hadoop.hdfs.protocol.DirectoryListing;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
@@ -2195,6 +2198,74 @@ public class TestFSNamesystemFGLIIP {
       count++;
     }
     assertEquals(total, count);
+  }
+
+  /**
+   * {@code startAfter} using the NN-internal INodePath form
+   * ({@code /.reserved/.inodes/<id>}) is resolved by the pilot path
+   * itself (HDFS-17386 Phase III / Track P.5) — no fallback to
+   * legacy. Verifies the pilot now calls
+   * {@link org.apache.hadoop.hdfs.server.namenode.FSDirStatAndListingOp#resolveInodePathStartAfter}
+   * and returns the correct continuation slice.
+   */
+  @Test
+  @Timeout(60)
+  public void getListingWithInodePathStartAfter() throws Exception {
+    Path dir = new Path("/gl-inode-start");
+    fs.mkdirs(dir);
+    final int total = 10;
+    for (int i = 0; i < total; i++) {
+      try (FSDataOutputStream out = fs.create(
+          new Path(dir, String.format("f%02d", i)))) {
+        out.write(new byte[4]);
+      }
+    }
+    // Pick the 3rd child (f02) and form an INodePath-style startAfter
+    // pointing at it. The listing should return f03..f09.
+    HdfsFileStatus third = fs.getClient().getFileInfo("/gl-inode-start/f02");
+    assertNotNull(third, "f02 must exist before forming startAfter");
+    byte[] startAfter = DFSUtil.string2Bytes(
+        "/.reserved/.inodes/" + third.getFileId());
+
+    DirectoryListing listing = fs.getClient().listPaths(
+        "/gl-inode-start", startAfter, false);
+    HdfsFileStatus[] partial = listing.getPartialListing();
+    assertEquals(total - 3, partial.length,
+        "INodePath startAfter must yield a 7-entry continuation");
+    assertEquals("f03", DFSUtil.bytes2String(partial[0].getLocalNameInBytes()));
+    assertEquals("f09", DFSUtil.bytes2String(
+        partial[partial.length - 1].getLocalNameInBytes()));
+  }
+
+  /**
+   * {@code startAfter} pointing at an inode that has been deleted
+   * surfaces as {@link DirectoryListingStartAfterNotFoundException}
+   * — matches the legacy contract and confirms the pilot's
+   * resolver propagates the failure rather than swallowing it.
+   */
+  @Test
+  @Timeout(60)
+  public void getListingWithDeletedInodeStartAfterThrows() throws Exception {
+    Path dir = new Path("/gl-inode-deleted");
+    fs.mkdirs(dir);
+    try (FSDataOutputStream out = fs.create(new Path(dir, "child"))) {
+      out.write(new byte[4]);
+    }
+    HdfsFileStatus child = fs.getClient().getFileInfo("/gl-inode-deleted/child");
+    assertNotNull(child);
+    long childId = child.getFileId();
+    assertTrue(fs.delete(new Path(dir, "child"), false));
+
+    byte[] startAfter = DFSUtil.string2Bytes("/.reserved/.inodes/" + childId);
+    // RPC layer wraps the exception; unwrap to assert the real cause.
+    org.apache.hadoop.ipc.RemoteException re = assertThrows(
+        org.apache.hadoop.ipc.RemoteException.class,
+        () -> fs.getClient().listPaths(
+            "/gl-inode-deleted", startAfter, false));
+    IOException unwrapped = re.unwrapRemoteException();
+    assertTrue(unwrapped instanceof DirectoryListingStartAfterNotFoundException,
+        "expected DirectoryListingStartAfterNotFoundException, got: "
+            + unwrapped.getClass().getName());
   }
 
   /**

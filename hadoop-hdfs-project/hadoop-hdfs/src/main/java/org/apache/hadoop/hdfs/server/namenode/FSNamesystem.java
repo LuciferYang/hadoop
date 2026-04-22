@@ -5918,26 +5918,16 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
 
   /**
    * Envelope-A (lock-free) check for the FGL_IIP {@code getListing}
-   * pilot path. Extends {@link #canUsePilotPathRead} with
-   * listing-specific rejections: INodePath-style startAfter (begins
-   * with '/') requires resolveComponents which the pilot envelope
-   * does not handle.
+   * pilot path. Delegates to {@link #canUsePilotPathRead}; as of
+   * HDFS-17386 Phase III / Track P.5 the pilot itself resolves
+   * INodePath-style {@code startAfter} via
+   * {@link FSDirStatAndListingOp#resolveInodePathStartAfter}, so no
+   * listing-specific rejection is needed here.
    *
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
    */
   private boolean canUsePilotGetListing(String src, byte[] startAfter) {
-    if (!canUsePilotPathRead(src)) {
-      return false;
-    }
-    // INodePath-style startAfter ("/.reserved/.inodes/<id>/<name>")
-    // requires FSDirectory.resolveComponents — legacy handles it
-    // (lines 62-75 of getListingInt). Pilot rejects and lets legacy
-    // handle.
-    if (startAfter != null && startAfter.length > 0
-        && startAfter[0] == org.apache.hadoop.fs.Path.SEPARATOR_CHAR) {
-      return false;
-    }
-    return true;
+    return canUsePilotPathRead(src);
   }
 
   /**

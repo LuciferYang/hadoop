@@ -57,22 +57,7 @@ class FSDirStatAndListingOp {
       throws IOException {
     final INodesInPath iip = fsd.resolvePath(pc, srcArg, DirOp.READ);
 
-    // Get file name when startAfter is an INodePath.  This is not the
-    // common case so avoid any unnecessary processing unless required.
-    if (startAfter.length > 0 && startAfter[0] == Path.SEPARATOR_CHAR) {
-      final String startAfterString = DFSUtil.bytes2String(startAfter);
-      if (FSDirectory.isReservedName(startAfterString)) {
-        try {
-          byte[][] components = INode.getPathComponents(startAfterString);
-          components = FSDirectory.resolveComponents(components, fsd);
-          startAfter = components[components.length - 1];
-        } catch (IOException e) {
-          // Possibly the inode is deleted
-          throw new DirectoryListingStartAfterNotFoundException(
-              "Can't find startAfter " + startAfterString);
-        }
-      }
-    }
+    startAfter = resolveInodePathStartAfter(fsd, startAfter);
 
     if (fsd.isPermissionEnabled()) {
       if (iip.getLastINode() != null && iip.getLastINode().isDirectory()) {
@@ -83,18 +68,58 @@ class FSDirStatAndListingOp {
   }
 
   /**
+   * Resolve an INodePath-style {@code startAfter} (begins with '/' and
+   * names a reserved path, typically
+   * {@code /.reserved/.inodes/<id>/<name>}) into the plain child name
+   * the listing iterator expects. Most calls pass a plain name, so the
+   * common path is an early return.
+   *
+   * <p>Caller must already hold whatever lock covers
+   * {@link FSDirectory#resolveComponents} (for legacy this is the FS
+   * read lock; for the FGL_IIP pilot path it is the compat-read taken
+   * by {@code PATH_READ}). The routine does not acquire any lock
+   * itself.
+   *
+   * @throws DirectoryListingStartAfterNotFoundException if the INode
+   *         referenced by {@code startAfter} cannot be resolved (e.g.
+   *         it has been deleted between listing batches).
+   */
+  static byte[] resolveInodePathStartAfter(FSDirectory fsd, byte[] startAfter)
+      throws DirectoryListingStartAfterNotFoundException {
+    // Get file name when startAfter is an INodePath. This is not the
+    // common case so avoid any unnecessary processing unless required.
+    if (startAfter.length == 0 || startAfter[0] != Path.SEPARATOR_CHAR) {
+      return startAfter;
+    }
+    final String startAfterString = DFSUtil.bytes2String(startAfter);
+    if (!FSDirectory.isReservedName(startAfterString)) {
+      return startAfter;
+    }
+    try {
+      byte[][] components = INode.getPathComponents(startAfterString);
+      components = FSDirectory.resolveComponents(components, fsd);
+      return components[components.length - 1];
+    } catch (IOException e) {
+      // Possibly the inode is deleted
+      throw new DirectoryListingStartAfterNotFoundException(
+          "Can't find startAfter " + startAfterString);
+    }
+  }
+
+  /**
    * FGL_IIP pilot overload of {@code getListingInt}. Caller has
    * already acquired {@code PATH_READ} on the target and verified
-   * the envelope (non-reserved, non-snapshot, non-INodePath-style
-   * startAfter). Skips {@code resolvePath} and the
-   * reserved-startAfter resolution; preserves the directory-only
-   * permission check.
+   * the envelope (non-reserved, non-snapshot src path). Skips
+   * {@code resolvePath}; preserves the directory-only permission
+   * check and the reserved-{@code startAfter} resolution (added via
+   * HDFS-17386 Phase III / Track P.5).
    *
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
    */
   static DirectoryListing getListingForPilot(FSDirectory fsd,
       FSPermissionChecker pc, INodesInPath iip, byte[] startAfter,
       boolean needLocation) throws IOException {
+    startAfter = resolveInodePathStartAfter(fsd, startAfter);
     if (fsd.isPermissionEnabled()
         && iip.getLastINode() != null
         && iip.getLastINode().isDirectory()) {
