@@ -3563,7 +3563,7 @@ public class TestFSNamesystemFGLIIP {
   // UnresolvedPathException directly (matching trunk's contract from
   // FSPermissionChecker.checkNotSymlink), so FileSystemLinkResolver on
   // the client transparently retries with the resolved path. These
-  // integration tests verify the end-to-end behaviour holds: traversal
+  // integration tests verify the end-to-end behavior holds: traversal
   // through a symlinked ancestor still returns the correct status, and
   // the symlink can be statted in place (READ_LINK semantics).
   // ======================================================================

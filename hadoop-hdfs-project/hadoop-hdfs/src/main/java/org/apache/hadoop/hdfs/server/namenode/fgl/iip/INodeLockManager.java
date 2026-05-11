@@ -339,9 +339,8 @@ public final class INodeLockManager {
         // that would fail anyway. A symlink AS the target is acceptable
         // (callers may treat it with READ_LINK semantics), so only
         // intercept when depth < last.
-        if (current instanceof INodeSymlink
-            && depth < components.length - 1) {
-          throw newUnresolvedPath(components, depth, (INodeSymlink) current);
+        if (current.isSymlink() && depth < components.length - 1) {
+          throw newUnresolvedPath(components, depth, current.asSymlink());
         }
 
         boolean writeHere = (depth == writeLockDepth);
@@ -417,6 +416,10 @@ public final class INodeLockManager {
    * IIPs. Targets (one level below each parent) are populated
    * without locking — protected by the parents' write locks.
    *
+   * @throws UnresolvedPathException on symlink in an ancestor position
+   *         of either path; clients retry with the resolved path
+   * @throws PilotEnvelopeMissException on other structural envelope
+   *         misses (INode reference, etc.)
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §1.4, §1.8
    */
   public LockedRenameIIPs acquireRename(String srcPath, String dstPath)
@@ -542,8 +545,16 @@ public final class INodeLockManager {
         throw new PilotEnvelopeMissException(
             "INodeReference in rename ancestor at depth " + depth);
       }
-      if (current instanceof INodeSymlink && depth < components.length - 1) {
-        throw newUnresolvedPath(components, depth, (INodeSymlink) current);
+      // Symlink in an ancestor position: same contract as the
+      // single-path walk above (see acquire()). The
+      // "depth < components.length - 1" guard is redundant here
+      // because walkAncestors's callers pass
+      // maxDepth = parentDepth - 1 = components.length - 3, so the
+      // loop never reaches the last component — but we keep the
+      // guard for parity with acquire() and as defense-in-depth
+      // against future callers that pass a deeper maxDepth.
+      if (current.isSymlink() && depth < components.length - 1) {
+        throw newUnresolvedPath(components, depth, current.asSymlink());
       }
       held.add(LockRef.acquire(pool, current.getId(), false,
           deadlineNanos));
