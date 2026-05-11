@@ -31,6 +31,7 @@ import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
 import org.apache.hadoop.hdfs.protocol.SnapshotAccessControlException;
+import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
@@ -665,6 +666,85 @@ public class FSDirAttrOp {
           EnumSet.of(XAttrSetFlag.CREATE, XAttrSetFlag.REPLACE));
     }
     XAttrStorage.updateINodeXAttrs(inode, newXAttrs, iip.getLatestSnapshotId());
+
+    // HDFS-17386 Phase III / Track P.6 (HDFS-17505): eagerly propagate
+    // the effective storage policy to every descendant file. After this
+    // walk INodeFile.getStoragePolicyID() can short-circuit on the local
+    // header field, and BlockManager no longer needs to hold an FS lock
+    // just to read the file's effective policy.
+    //
+    // If the directory's new policy is UNSPECIFIED (i.e., we just
+    // unsetStoragePolicy), the effective policy of its descendants
+    // depends on the grand-ancestor chain — recompute from this
+    // directory's parent.
+    final byte effective = (policyId
+        == HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED)
+        ? inheritedStoragePolicyFromAncestors(inode)
+        : policyId;
+    propagateStoragePolicyToDescendantFiles(inode, effective,
+        iip.getLatestSnapshotId());
+  }
+
+  /**
+   * Recursively set the local storage-policy ID on every file under
+   * {@code dir}, using {@code dirEffectivePolicy} as the inherited
+   * policy. Descendant directories that carry their own explicit
+   * XAttr policy override the inherited value for THEIR subtree.
+   *
+   * <p>References and symlinks are skipped. Snapshots are honoured via
+   * {@link INodeFile#setStoragePolicyID(byte, int)} which records
+   * modification against {@code latestSnapshotId}.
+   *
+   * @param dir                  directory whose descendants to update
+   * @param dirEffectivePolicy   effective policy seen by descendants
+   *                             of {@code dir} that do not have their
+   *                             own XAttr policy
+   * @param latestSnapshotId     snapshot context for recordModification
+   */
+  static void propagateStoragePolicyToDescendantFiles(INode dir,
+      byte dirEffectivePolicy, int latestSnapshotId)
+      throws QuotaExceededException {
+    if (dir == null || !dir.isDirectory() || dir.isReference()) {
+      return;
+    }
+    for (INode child : dir.asDirectory().getChildrenList(
+        Snapshot.CURRENT_STATE_ID)) {
+      if (child.isReference() || child.isSymlink()) {
+        continue;
+      }
+      if (child.isFile()) {
+        child.asFile().setStoragePolicyID(dirEffectivePolicy,
+            latestSnapshotId);
+      } else if (child.isDirectory()) {
+        // Subtree below an explicit-XAttr directory inherits from
+        // that directory, not from dir.
+        final byte childLocal = child.getLocalStoragePolicyID();
+        final byte childEffective =
+            (childLocal == HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED)
+                ? dirEffectivePolicy
+                : childLocal;
+        propagateStoragePolicyToDescendantFiles(child, childEffective,
+            latestSnapshotId);
+      }
+    }
+  }
+
+  /**
+   * Walk the parent chain of {@code start} (exclusive) to find the
+   * first non-{@code UNSPECIFIED} local storage-policy ID. Used to
+   * recompute the effective policy after an {@code unsetStoragePolicy}
+   * clears the policy on {@code start} itself.
+   */
+  private static byte inheritedStoragePolicyFromAncestors(INode start) {
+    INode anc = start.getParent();
+    while (anc != null) {
+      byte local = anc.getLocalStoragePolicyID();
+      if (local != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
+        return local;
+      }
+      anc = anc.getParent();
+    }
+    return HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED;
   }
 
   static boolean unprotectedSetTimes(

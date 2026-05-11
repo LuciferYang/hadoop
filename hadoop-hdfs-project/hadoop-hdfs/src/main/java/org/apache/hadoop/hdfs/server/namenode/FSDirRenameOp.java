@@ -240,6 +240,7 @@ class FSDirRenameOp {
 
         tx.updateMtimeAndLease(timestamp);
         tx.updateQuotasInSourceTree(fsd.getBlockStoragePolicySuite());
+        repropagateStoragePolicyAfterRename(renamedIIP);
 
         return renamedIIP;
       }
@@ -464,6 +465,7 @@ class FSDirRenameOp {
         }
 
         tx.updateMtimeAndLease(timestamp);
+        repropagateStoragePolicyAfterRename(renamedIIP);
 
         // Collect the blocks and remove the lease for previous dst
         boolean filesDeleted = false;
@@ -922,6 +924,47 @@ class FSDirRenameOp {
     FileStatus auditStat = success ? fsd.getAuditFileInfo(dst) : null;
     return new RenameResult(
         success, auditStat, filesDeleted, collectedBlocks);
+  }
+
+  /**
+   * HDFS-17386 Phase III / Track P.6 (HDFS-17505): after a successful
+   * rename, push the destination's effective storage policy onto every
+   * file in the moved subtree so {@link INodeFile#getStoragePolicyID()}
+   * can short-circuit on the local header. BlockManager then reads the
+   * file's policy without walking the parent chain — the read no
+   * longer needs an FS-lock.
+   *
+   * <p>Semantic change from the pre-P.6 lazy model: a file's effective
+   * policy now follows its current location, even if a previous
+   * setStoragePolicy on the file itself recorded an explicit value.
+   * Per HDFS-17505 this is the intended trade-off.
+   */
+  private static void repropagateStoragePolicyAfterRename(
+      INodesInPath renamedIIP) throws QuotaExceededException {
+    INode moved = renamedIIP.getLastINode();
+    if (moved == null || moved.isReference() || moved.isSymlink()) {
+      return;
+    }
+    INode newParent = renamedIIP.length() >= 2
+        ? renamedIIP.getINode(-2) : null;
+    if (newParent == null) {
+      return;
+    }
+    final byte parentEffective = newParent.getStoragePolicyID();
+    final int latestSnapshotId = renamedIIP.getLatestSnapshotId();
+    if (moved.isFile()) {
+      moved.asFile().setStoragePolicyID(parentEffective, latestSnapshotId);
+      return;
+    }
+    // Directory: a directory may have its own explicit XAttr policy
+    // which wins over the inherited effective for ITS subtree.
+    final byte movedLocal = moved.getLocalStoragePolicyID();
+    final byte movedEffective =
+        (movedLocal == HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED)
+            ? parentEffective
+            : movedLocal;
+    FSDirAttrOp.propagateStoragePolicyToDescendantFiles(moved,
+        movedEffective, latestSnapshotId);
   }
 
   static class RenameResult {

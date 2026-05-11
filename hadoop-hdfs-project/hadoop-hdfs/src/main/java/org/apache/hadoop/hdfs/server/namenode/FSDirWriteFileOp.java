@@ -37,6 +37,7 @@ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.protocol.FSLimitException;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
@@ -856,14 +857,22 @@ class FSDirWriteFileOp {
       inode.setStoragePolicyID(lpPolicy.getId(),
                                  iip.getLatestSnapshotId());
     } else {
-      BlockStoragePolicy effectivePolicy =
-          bm.getStoragePolicy(inode.getStoragePolicyID());
-
-      if (effectivePolicy != null &&
-          effectivePolicy.isCopyOnCreateFile()) {
-        // Copy effective policy from ancestor directory to current file.
-        inode.setStoragePolicyID(effectivePolicy.getId(),
-                                 iip.getLatestSnapshotId());
+      // HDFS-17386 Phase III / Track P.6 (HDFS-17505): if any ancestor
+      // has an explicit storage policy, eagerly copy that effective
+      // policy onto the newly-created file. INodeFile.getStoragePolicyID()
+      // can then return the local field directly — BlockManager no
+      // longer needs to walk the parent chain (and so doesn't need an
+      // FS lock) just to read the file's policy.
+      //
+      // When NO ancestor has an explicit policy, leave the file's
+      // local as UNSPECIFIED — the file is genuinely "policy not set"
+      // and a future setStoragePolicy on an ancestor will reach it
+      // through propagateStoragePolicyToDescendantFiles. Pre-P.6
+      // behaviour copied down only for COPY_ON_CREATE policies (e.g.
+      // LAZY_PERSIST) and resolved everything else lazily.
+      byte effective = inode.getStoragePolicyID();
+      if (effective != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
+        inode.setStoragePolicyID(effective, iip.getLatestSnapshotId());
       }
     }
   }

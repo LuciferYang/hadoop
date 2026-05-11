@@ -5014,10 +5014,12 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
         if (ad.isWithQuota()) {
           return false;
         }
-        if (ad.getLocalStoragePolicyID()
-            != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
-          return false;
-        }
+        // HDFS-17386 Phase III / Track P.6 (HDFS-17505): a non-default
+        // ancestor storage policy is no longer an envelope miss. Eager
+        // propagation in FSDirAttrOp.setDirStoragePolicy + the file-
+        // creation path stamps the effective policy onto every
+        // descendant file's local header, so the pilot doesn't need to
+        // walk ancestors to discover the policy.
       }
     }
     return true;
@@ -5057,10 +5059,9 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
         if (ad.isWithQuota()) {
           return false;
         }
-        if (ad.getLocalStoragePolicyID()
-            != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
-          return false;
-        }
+        // HDFS-17386 Phase III / Track P.6 (HDFS-17505): non-default
+        // ancestor storage policy is no longer an envelope miss — see
+        // ancestorsAllowCreate's comment for the propagation story.
       }
     }
     return true;

@@ -3615,5 +3615,118 @@ public class TestFSNamesystemFGLIIP {
         linkStat.getSymlink().toUri().getPath(),
         "link target must point to /sym-real-2");
   }
+
+  // ======================================================================
+  // HDFS-17386 Phase III / Track P.6 (HDFS-17505): eager storage-policy
+  // propagation.
+  //
+  // Before P.6 the pilot envelope rejected any path whose ancestor had
+  // a non-default storage policy — INodeFile.getStoragePolicyID() walked
+  // ancestors under the FS lock and that walk was not safe under the
+  // narrow IIP locks. After P.6 setStoragePolicy / unsetStoragePolicy /
+  // rename eagerly stamp the effective policy onto every descendant
+  // file, so the file's local header always carries the policy and
+  // BlockManager can read it without walking — and the envelope no
+  // longer needs to reject these paths.
+  // ======================================================================
+
+  @Test
+  @Timeout(60)
+  public void setStoragePolicyOnDirectoryPropagatesToFiles() throws Exception {
+    // Create /sp-dir/a/file1 and /sp-dir/b/file2 BEFORE setting policy.
+    // HOT is the default and writes to DISK; WARM also accepts DISK as
+    // its primary, so WARM works on the DISK-only MiniDFSCluster.
+    Path dir = new Path("/sp-dir");
+    Path subA = new Path(dir, "a");
+    Path subB = new Path(dir, "b");
+    fs.mkdirs(subA);
+    fs.mkdirs(subB);
+    Path file1 = new Path(subA, "file1");
+    Path file2 = new Path(subB, "file2");
+    try (FSDataOutputStream out = fs.create(file1)) {
+      out.write(new byte[4]);
+    }
+    try (FSDataOutputStream out = fs.create(file2)) {
+      out.write(new byte[4]);
+    }
+
+    // Set WARM on the parent directory — every existing file under it
+    // must end up with WARM as its LOCAL storage policy.
+    fs.setStoragePolicy(dir, HdfsConstants.WARM_STORAGE_POLICY_NAME);
+
+    assertEquals(HdfsConstants.WARM_STORAGE_POLICY_ID,
+        readLocalStoragePolicy(file1),
+        "file1 local policy should be WARM after dir-level setStoragePolicy");
+    assertEquals(HdfsConstants.WARM_STORAGE_POLICY_ID,
+        readLocalStoragePolicy(file2),
+        "file2 local policy should be WARM after dir-level setStoragePolicy");
+  }
+
+  @Test
+  @Timeout(60)
+  public void newFileInheritsLocalStoragePolicyAtCreation()
+      throws Exception {
+    // Set WARM on the directory, then create a file inside. The new
+    // file's LOCAL policy must be WARM, not UNSPECIFIED — pre-P.6 only
+    // COPY_ON_CREATE policies (e.g. LAZY_PERSIST) were copied down.
+    Path dir = new Path("/sp-inherit");
+    fs.mkdirs(dir);
+    fs.setStoragePolicy(dir, HdfsConstants.WARM_STORAGE_POLICY_NAME);
+
+    Path child = new Path(dir, "child");
+    try (FSDataOutputStream out = fs.create(child)) {
+      out.write(new byte[4]);
+    }
+
+    assertEquals(HdfsConstants.WARM_STORAGE_POLICY_ID,
+        readLocalStoragePolicy(child),
+        "new file should inherit WARM locally, not stay UNSPECIFIED");
+  }
+
+  @Test
+  @Timeout(60)
+  public void renameRepropagatesStoragePolicy() throws Exception {
+    // /sp-ren/warm/file starts with WARM locally. After rename into
+    // /sp-ren/hot, the moved file's local policy must become HOT.
+    // Both policies are compatible with DISK storage, the only type
+    // available in the MiniDFSCluster.
+    Path warmDir = new Path("/sp-ren/warm");
+    Path hotDir = new Path("/sp-ren/hot");
+    fs.mkdirs(warmDir);
+    fs.mkdirs(hotDir);
+    fs.setStoragePolicy(warmDir, HdfsConstants.WARM_STORAGE_POLICY_NAME);
+    fs.setStoragePolicy(hotDir, HdfsConstants.HOT_STORAGE_POLICY_NAME);
+
+    Path src = new Path(warmDir, "file");
+    try (FSDataOutputStream out = fs.create(src)) {
+      out.write(new byte[4]);
+    }
+    assertEquals(HdfsConstants.WARM_STORAGE_POLICY_ID,
+        readLocalStoragePolicy(src),
+        "file should be WARM before rename");
+
+    Path dst = new Path(hotDir, "file");
+    assertTrue(fs.rename(src, dst));
+
+    assertEquals(HdfsConstants.HOT_STORAGE_POLICY_ID,
+        readLocalStoragePolicy(dst),
+        "file should be HOT after rename into hot dir");
+  }
+
+  /**
+   * Read the file's LOCAL storage-policy ID (i.e., the value stamped
+   * on its own INodeFile header). Distinct from the effective policy
+   * returned by {@code getStoragePolicy}, which on pre-P.6 trunk
+   * would walk ancestors when the local field is UNSPECIFIED.
+   */
+  private byte readLocalStoragePolicy(Path p) throws Exception {
+    org.apache.hadoop.hdfs.server.namenode.FSNamesystem fsn =
+        cluster.getNameNode().getNamesystem();
+    org.apache.hadoop.hdfs.server.namenode.FSDirectory dir = fsn.getFSDirectory();
+    org.apache.hadoop.hdfs.server.namenode.INode inode =
+        dir.getINode(p.toUri().getPath());
+    assertNotNull(inode, "INode for " + p + " not found");
+    return inode.getLocalStoragePolicyID();
+  }
 }
 
