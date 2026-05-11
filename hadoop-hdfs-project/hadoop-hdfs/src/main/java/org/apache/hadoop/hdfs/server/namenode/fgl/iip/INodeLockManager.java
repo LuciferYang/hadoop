@@ -28,6 +28,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.fs.InvalidPathException;
+import org.apache.hadoop.hdfs.DFSUtil;
+import org.apache.hadoop.hdfs.protocol.UnresolvedPathException;
 import org.apache.hadoop.hdfs.server.namenode.INode;
 import org.apache.hadoop.hdfs.server.namenode.INodeDirectory;
 import org.apache.hadoop.hdfs.server.namenode.INodeSymlink;
@@ -55,7 +57,9 @@ import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
  *   <li>Walk from the root INode down each component. At each level:
  *     <ul>
  *       <li>Check for a symlink in an ancestor position — if present,
- *           throw {@link PilotEnvelopeMissException}.</li>
+ *           throw {@link UnresolvedPathException} (the client retries
+ *           with the resolved path; matches trunk's contract from
+ *           {@code FSPermissionChecker.checkNotSymlink}).</li>
  *       <li>Acquire this level's lock — write if the level equals the
  *           mode's target depth, read otherwise. Locks are acquired
  *           from {@link LockPool} with the remaining budget.</li>
@@ -206,8 +210,12 @@ public final class INodeLockManager {
    * @return a {@link LockedIIP} handle owning all acquired locks
    * @throws InvalidPathException            if the path is invalid for
    *                                         the requested mode
-   * @throws PilotEnvelopeMissException      if a symlink appears in an
-   *                                         ancestor position
+   * @throws UnresolvedPathException         if a symlink appears in an
+   *                                         ancestor position; clients
+   *                                         retry with the resolved path
+   * @throws PilotEnvelopeMissException      on other structural
+   *                                         envelope misses (INode
+   *                                         reference, etc.)
    * @throws LockAcquisitionTimeoutException if any lock cannot be
    *                                         acquired within the deadline
    * @throws InterruptedException            if the caller is interrupted
@@ -324,14 +332,16 @@ public final class INodeLockManager {
                   + " (snapshot territory): " + path);
         }
 
-        // Envelope miss: symlink in an ancestor position. A symlink
-        // AS the target is acceptable (caller may treat it with
-        // READ_LINK semantics), so only reject when depth < last.
+        // Symlink in an ancestor position: throw UnresolvedPathException
+        // directly so the client retries with the resolved path. This
+        // matches trunk's contract (see FSPermissionChecker.checkNotSymlink)
+        // and avoids an unnecessary global-lock fallback for a request
+        // that would fail anyway. A symlink AS the target is acceptable
+        // (callers may treat it with READ_LINK semantics), so only
+        // intercept when depth < last.
         if (current instanceof INodeSymlink
             && depth < components.length - 1) {
-          throw new PilotEnvelopeMissException(
-              "symlink in ancestor path component at depth " + depth
-                  + ": " + path);
+          throw newUnresolvedPath(components, depth, (INodeSymlink) current);
         }
 
         boolean writeHere = (depth == writeLockDepth);
@@ -533,8 +543,7 @@ public final class INodeLockManager {
             "INodeReference in rename ancestor at depth " + depth);
       }
       if (current instanceof INodeSymlink && depth < components.length - 1) {
-        throw new PilotEnvelopeMissException(
-            "symlink in rename ancestor at depth " + depth);
+        throw newUnresolvedPath(components, depth, (INodeSymlink) current);
       }
       held.add(LockRef.acquire(pool, current.getId(), false,
           deadlineNanos));
@@ -567,6 +576,36 @@ public final class INodeLockManager {
       inodes[targetDepth] = inodes[parentDepth].asDirectory()
           .getChild(components[targetDepth], Snapshot.CURRENT_STATE_ID);
     }
+  }
+
+  /**
+   * Build the {@link UnresolvedPathException} for a symlink discovered
+   * at {@code depth} during the IIP walk. Mirrors the constructor call
+   * in {@code FSPermissionChecker.checkNotSymlink} so clients see the
+   * same exception they would get from the legacy traversal path.
+   *
+   * @param components path components being walked
+   * @param depth      zero-based index of the symlink within components
+   * @param link       the symlink INode
+   */
+  private static UnresolvedPathException newUnresolvedPath(
+      byte[][] components, int depth, INodeSymlink link) {
+    final int last = components.length - 1;
+    final String path = pathString(components, 0, last);
+    final String preceding = pathString(components, 0, depth - 1);
+    final String remainder = pathString(components, depth + 1, last);
+    final String target = link.getSymlinkString();
+    return new UnresolvedPathException(path, preceding, remainder, target);
+  }
+
+  /**
+   * Mirrors {@code FSPermissionChecker.getPath(components, start, end)}:
+   * build the path string for the inclusive range {@code [start, end]}.
+   * {@link DFSUtil#byteArray2PathString} returns the empty string when
+   * {@code length == 0}, so {@code end == start - 1} produces "".
+   */
+  private static String pathString(byte[][] components, int start, int end) {
+    return DFSUtil.byteArray2PathString(components, start, end - start + 1);
   }
 
   /**

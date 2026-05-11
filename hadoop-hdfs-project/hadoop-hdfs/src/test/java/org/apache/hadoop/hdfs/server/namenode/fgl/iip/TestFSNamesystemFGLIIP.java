@@ -3553,5 +3553,67 @@ public class TestFSNamesystemFGLIIP {
     assertFalse(fs.exists(src1));
     assertFalse(fs.exists(src2));
   }
+
+  // ======================================================================
+  // HDFS-17386 Phase III / Track P.6: symlink resolution under FGL_IIP.
+  //
+  // The pilot used to throw PilotEnvelopeMissException whenever an
+  // ancestor was an INodeSymlink, which forced a fallback to the
+  // global-lock legacy path. With P.6 the pilot throws
+  // UnresolvedPathException directly (matching trunk's contract from
+  // FSPermissionChecker.checkNotSymlink), so FileSystemLinkResolver on
+  // the client transparently retries with the resolved path. These
+  // integration tests verify the end-to-end behaviour holds: traversal
+  // through a symlinked ancestor still returns the correct status, and
+  // the symlink can be statted in place (READ_LINK semantics).
+  // ======================================================================
+
+  @Test
+  @Timeout(60)
+  public void getFileStatusThroughSymlinkAncestor() throws Exception {
+    // Symlinks must be globally enabled before the DFS client will
+    // create or follow them — defaults to off in production builds.
+    FileSystem.enableSymlinks();
+
+    Path realDir = new Path("/sym-real");
+    fs.mkdirs(realDir);
+    Path realFile = new Path(realDir, "data");
+    try (FSDataOutputStream out = fs.create(realFile)) {
+      out.write(new byte[16]);
+    }
+
+    Path link = new Path("/sym-link");
+    fs.createSymlink(realDir, link, false);
+
+    // /sym-link/data has the symlink in an ancestor position. The
+    // pilot throws UnresolvedPathException; the client retries through
+    // FileSystemLinkResolver and we observe the resolved file.
+    FileStatus through = fs.getFileStatus(new Path("/sym-link/data"));
+    assertEquals(16L, through.getLen(),
+        "client should resolve /sym-link/data to /sym-real/data");
+  }
+
+  @Test
+  @Timeout(60)
+  public void getFileLinkStatusOnSymlinkTarget() throws Exception {
+    // Symlink AS the target (last component) — the pilot should walk
+    // successfully and return an IIP whose tail is the symlink itself.
+    // getFileLinkStatus uses READ_LINK semantics and must NOT trigger
+    // a client-side retry.
+    FileSystem.enableSymlinks();
+
+    Path realDir = new Path("/sym-real-2");
+    fs.mkdirs(realDir);
+    Path link = new Path("/sym-link-2");
+    fs.createSymlink(realDir, link, false);
+
+    FileStatus linkStat = fs.getFileLinkStatus(link);
+    assertTrue(linkStat.isSymlink(), "expected /sym-link-2 to be a symlink");
+    // The returned target Path is fully-qualified ("hdfs://host:port/sym-real-2")
+    // while realDir is a bare "/sym-real-2"; compare on the path component only.
+    assertEquals(realDir.toUri().getPath(),
+        linkStat.getSymlink().toUri().getPath(),
+        "link target must point to /sym-real-2");
+  }
 }
 

@@ -109,6 +109,7 @@ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsLocatedFileStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedStripedBlock;
 import org.apache.hadoop.hdfs.protocol.SnapshotStatus;
+import org.apache.hadoop.hdfs.protocol.UnresolvedPathException;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_STORAGE_POLICY_ENABLED_KEY;
 import static org.apache.hadoop.hdfs.server.namenode.FSDirStatAndListingOp.*;
 import static org.apache.hadoop.ha.HAServiceProtocol.HAServiceState.ACTIVE;
@@ -2264,8 +2265,10 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    *       create-class envelope for consistency).</li>
    * </ul>
    *
-   * @throws PilotEnvelopeMissException on structural misses during
-   *         the walk (symlink in ancestor, INode reference)
+   * @throws UnresolvedPathException on symlink in ancestor position
+   *         (client retries with resolved path)
+   * @throws PilotEnvelopeMissException on other structural misses
+   *         during the walk (INode reference)
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.4, §3.1
    */
   private FileStatus setPermissionPilot(String src, FsPermission permission,
@@ -2441,9 +2444,10 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * handled by the caller after the pilot lock is released (same phase
    * as the legacy path).
    *
-   * @throws PilotEnvelopeMissException on structural envelope misses
-   *         detected during the walk (symlink in ancestor, INode
-   *         reference, etc.)
+   * @throws UnresolvedPathException on symlink in ancestor position
+   *         (client retries with resolved path)
+   * @throws PilotEnvelopeMissException on other structural envelope
+   *         misses detected during the walk (INode reference, etc.)
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
    */
   private GetBlockLocationsResult getBlockLocationsPilot(String src,
@@ -3489,8 +3493,10 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @return a fresh {@link HdfsFileStatus} on success, or {@code null}
    *         if the call should fall back to the legacy path due to an
    *         envelope miss discovered under held locks
-   * @throws PilotEnvelopeMissException on structural envelope misses
-   *         detected during the walk (symlink in ancestor, etc.)
+   * @throws UnresolvedPathException on symlink in ancestor position
+   *         (client retries with resolved path)
+   * @throws PilotEnvelopeMissException on other structural envelope
+   *         misses detected during the walk
    */
   private HdfsFileStatus startFilePilot(String src,
       PermissionStatus permissions, String holder, String clientMachine,
@@ -4444,9 +4450,10 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    *         if the call should fall back to the legacy path due to an
    *         envelope miss discovered under held locks (the {@code holder}
    *         parameter is set only on success).
-   * @throws PilotEnvelopeMissException on structural envelope misses
-   *         detected during the walk (symlink in ancestor, INode
-   *         reference, etc.)
+   * @throws UnresolvedPathException on symlink in ancestor position
+   *         (client retries with resolved path)
+   * @throws PilotEnvelopeMissException on other structural envelope
+   *         misses detected during the walk (INode reference, etc.)
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.10, §3.1
    */
   private Boolean deletePilot(String src, boolean logRetryCache,
@@ -4756,9 +4763,10 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * pre-resolved-IIP overload of
    * {@link FSDirStatAndListingOp#isFileClosed(FSDirectory, INodesInPath, String)}.
    *
-   * @throws PilotEnvelopeMissException on structural envelope misses
-   *         detected during the walk (symlink in ancestor, INode
-   *         reference, etc.)
+   * @throws UnresolvedPathException on symlink in ancestor position
+   *         (client retries with resolved path)
+   * @throws PilotEnvelopeMissException on other structural envelope
+   *         misses detected during the walk (INode reference, etc.)
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.9, §3.1
    */
   private boolean isFileClosedPilot(String src, FSPermissionChecker pc)
@@ -5123,8 +5131,10 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @return the audit {@link FileStatus} on success, or {@code null} if
    *         the call should fall back to the legacy path due to an
    *         envelope miss discovered under held locks
-   * @throws PilotEnvelopeMissException on structural envelope misses
-   *         detected during the walk (symlink in ancestor, etc.)
+   * @throws UnresolvedPathException on symlink in ancestor position
+   *         (client retries with resolved path)
+   * @throws PilotEnvelopeMissException on other structural envelope
+   *         misses detected during the walk
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §2.10, §3.1
    */
   private FileStatus mkdirsPilot(String src, PermissionStatus permissions,

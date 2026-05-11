@@ -36,9 +36,11 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.hadoop.fs.InvalidPathException;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.fs.permission.PermissionStatus;
+import org.apache.hadoop.hdfs.protocol.UnresolvedPathException;
 import org.apache.hadoop.hdfs.server.namenode.INode;
 import org.apache.hadoop.hdfs.server.namenode.INodeDirectory;
 import org.apache.hadoop.hdfs.server.namenode.INodeFile;
+import org.apache.hadoop.hdfs.server.namenode.INodeSymlink;
 import org.apache.hadoop.hdfs.server.namenode.INodesInPath;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -577,5 +579,138 @@ public class TestINodeLockManager {
       compat.writeLock().unlock();
     }
     assertEquals(0, pool.size());
+  }
+
+  // -------- Symlink handling (HDFS-17386 Phase III / Track P.6) --------
+
+  /**
+   * Construct an {@link INodeSymlink} via reflection. The constructor is
+   * package-private in the {@code namenode} package and this test class
+   * lives in {@code namenode.fgl.iip}, so direct invocation is not
+   * possible. The reflection is contained to this single helper.
+   */
+  private static INodeSymlink symlink(long id, String name, String target)
+      throws Exception {
+    java.lang.reflect.Constructor<INodeSymlink> ctor =
+        INodeSymlink.class.getDeclaredConstructor(
+            long.class, byte[].class, PermissionStatus.class,
+            long.class, long.class, String.class);
+    ctor.setAccessible(true);
+    return ctor.newInstance(id, name.getBytes(), PERM, 0L, 0L, target);
+  }
+
+  /**
+   * Symlink discovered in an ancestor position during a PATH_READ walk
+   * must surface as {@link UnresolvedPathException} rather than the
+   * generic {@code PilotEnvelopeMissException}. This is the contract
+   * trunk uses (see {@code FSPermissionChecker.checkNotSymlink}) and
+   * lets clients retry transparently via {@code FileSystemLinkResolver}
+   * without paying for a global-lock fallback round-trip.
+   */
+  @Test
+  @Timeout(10)
+  public void pathReadThroughSymlinkAncestorThrowsUnresolvedPath()
+      throws Exception {
+    // Add /a/s -> /target so /a/s/anything has a symlink at depth 2.
+    INodeSymlink s = symlink(7L, "s", "/target");
+    a.addChild(s);
+
+    UnresolvedPathException upe = assertThrows(
+        UnresolvedPathException.class,
+        () -> mgr.acquire("/a/s/x", IIPAcquireMode.PATH_READ));
+    // Sanity-check the message wiring — the symlink target should
+    // appear in the exception (FileSystemLinkResolver depends on it).
+    assertTrue(upe.getMessage() != null && upe.getMessage().contains("/target"),
+        "expected target /target in message, got: " + upe.getMessage());
+
+    // All locks must have been released before the exception propagated.
+    assertEquals(0, pool.size());
+    assertEquals(0, compat.getReadHoldCount());
+    assertEquals(Integer.valueOf(0), INodeLockManager.HELD_IIP_DEPTH.get());
+  }
+
+  /**
+   * Same as the PATH_READ case but for PATH_WRITE: the write-lock plan
+   * must not mask the symlink-in-ancestor error.
+   */
+  @Test
+  @Timeout(10)
+  public void pathWriteThroughSymlinkAncestorThrowsUnresolvedPath()
+      throws Exception {
+    INodeSymlink s = symlink(7L, "s", "/target");
+    a.addChild(s);
+
+    assertThrows(UnresolvedPathException.class,
+        () -> mgr.acquire("/a/s/x", IIPAcquireMode.PATH_WRITE));
+    assertEquals(0, pool.size());
+    assertEquals(Integer.valueOf(0), INodeLockManager.HELD_IIP_DEPTH.get());
+  }
+
+  /**
+   * Symlink AS the target (last component) is acceptable — the caller
+   * may want READ_LINK semantics. The walk succeeds and returns an IIP
+   * whose last INode is the symlink.
+   */
+  @Test
+  @Timeout(10)
+  public void pathReadOnSymlinkTargetSucceeds() throws Exception {
+    INodeSymlink s = symlink(7L, "s", "/target");
+    a.addChild(s);
+
+    try (LockedIIP lip = mgr.acquire("/a/s", IIPAcquireMode.PATH_READ)) {
+      INodesInPath iip = lip.iip();
+      assertEquals(3, iip.length());
+      assertEquals(root, iip.getINode(0));
+      assertEquals(a, iip.getINode(1));
+      assertEquals(s, iip.getINode(2),
+          "symlink as terminal component must be returned to caller");
+      assertEquals(3, pool.size(), "root, a, s all pinned");
+    }
+    assertEquals(0, pool.size());
+  }
+
+  /**
+   * Symlink discovered in the source-side ancestor walk of a rename
+   * must throw {@link UnresolvedPathException} — same contract as the
+   * single-path walk.
+   *
+   * <p>{@code acquireRename} walks ancestors only as far as the
+   * grandparent, so the symlink must sit <em>strictly above</em> the
+   * rename parent for the walk to encounter it (otherwise it is picked
+   * up by {@code discoverParent} on an unlocked path). Hence the
+   * 5-component src path {@code /a/s/x/y}: walkAncestors traverses
+   * {@code root}, {@code /a}, {@code /a/s} — and trips the symlink
+   * check at depth 2.
+   */
+  @Test
+  @Timeout(10)
+  public void renameSrcThroughSymlinkAncestorThrowsUnresolvedPath()
+      throws Exception {
+    INodeSymlink s = symlink(7L, "s", "/target");
+    a.addChild(s);
+
+    assertThrows(UnresolvedPathException.class,
+        () -> mgr.acquireRename("/a/s/x/y", "/a/d"));
+    assertEquals(0, pool.size());
+    assertEquals(Integer.valueOf(0), INodeLockManager.HELD_IIP_DEPTH.get());
+  }
+
+  /**
+   * Symlink discovered in the destination-side ancestor walk of a
+   * rename must also throw {@link UnresolvedPathException}. Same
+   * positioning rule as the src case: the symlink must be above the
+   * rename parent so {@code walkAncestors} actually visits it.
+   */
+  @Test
+  @Timeout(10)
+  public void renameDstThroughSymlinkAncestorThrowsUnresolvedPath()
+      throws Exception {
+    INodeSymlink s = symlink(7L, "s", "/target");
+    a.addChild(s);
+
+    assertThrows(UnresolvedPathException.class,
+        () -> mgr.acquireRename("/a/d", "/a/s/x/y"));
+    assertEquals(0, pool.size());
+    assertEquals(Integer.valueOf(0), INodeLockManager.HELD_IIP_DEPTH.get());
   }
 }
