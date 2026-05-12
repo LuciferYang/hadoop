@@ -3523,8 +3523,11 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
             "startFile: parent missing or not a directory " + src);
       }
       if (!ancestorsAllowCreate(iip)) {
+        // After P.2 / P.3 this branch is currently unreachable —
+        // ancestorsAllowCreate has no rejection conditions left.
+        // Retained as a hook for future create-class structural checks.
         throw new PilotEnvelopeMissException(
-            "startFile: ancestor has quota " + src);
+            "startFile: create-class envelope reject " + src);
       }
       if (iip.getLastINode() != null) {
         throw new PilotEnvelopeMissException(
@@ -5014,25 +5017,16 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * @see docs/fgl/HDFS-17385-wave4-pilot-design.md §3.1
    */
   private boolean ancestorsAllowCreate(INodesInPath iip) {
+    // After P.2 (HDFS-17473) — QuotaLocks gives verify-then-update
+    // atomicity in FSDirectory.updateCount — and P.3 (HDFS-17505) —
+    // eager storage-policy propagation onto descendant files — there
+    // are currently no rejection conditions specific to create-class
+    // RPCs. The walk is kept as the documented hook point where any
+    // future create-class structural check would slot in.
     for (int i = 0; i < iip.length() - 1; i++) {
       INode anc = iip.getINode(i);
       if (anc == null) {
         break;
-      }
-      if (anc.isDirectory()) {
-        INodeDirectory ad = anc.asDirectory();
-        // HDFS-17386 Phase III / Track P.2 (HDFS-17473): a quota-bearing
-        // ancestor is no longer an envelope miss. FSDirectory.updateCount
-        // now acquires per-feature locks via QuotaLocks before
-        // verifying and mutating ancestor usage, providing the
-        // verify-then-update atomicity that the FS write lock used to
-        // give us.
-        // HDFS-17386 Phase III / Track P.3 (HDFS-17505): a non-default
-        // ancestor storage policy is no longer an envelope miss. Eager
-        // propagation in FSDirAttrOp.setDirStoragePolicy + the file-
-        // creation path stamps the effective policy onto every
-        // descendant file's local header, so the pilot doesn't need to
-        // walk ancestors to discover the policy.
       }
     }
     return true;
@@ -5181,8 +5175,11 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
             "mkdirs: parent missing or not a directory " + src);
       }
       if (!ancestorsAllowCreate(iip)) {
+        // After P.2 / P.3 this branch is currently unreachable —
+        // ancestorsAllowCreate has no rejection conditions left.
+        // Retained as a hook for future create-class structural checks.
         throw new PilotEnvelopeMissException(
-            "mkdirs: ancestor has quota " + src);
+            "mkdirs: create-class envelope reject " + src);
       }
 
       // Permission checks: traversal (execute) on every ancestor PLUS

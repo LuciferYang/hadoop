@@ -24,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -83,14 +84,59 @@ public class TestQuotaLocks {
   @Timeout(10)
   public void emptyHandleIsIdempotentOnClose() {
     QuotaLocks.LockedQuota handle = QuotaLocks.LockedQuota.EMPTY;
+    // Two close() calls in a row must not throw — the test passes by
+    // the absence of an exception.
     handle.close();
-    handle.close(); // double-close must not throw
-    assertNotNull(handle);
+    handle.close();
+  }
+
+  @Test
+  @Timeout(10)
+  public void acquireForNullIIPReturnsEmpty() {
+    QuotaLocks pool = new QuotaLocks();
+    try (QuotaLocks.LockedQuota handle = pool.acquireForIIP(null, 5)) {
+      assertSame(QuotaLocks.LockedQuota.EMPTY, handle,
+          "null IIP must yield the EMPTY handle, no locks acquired");
+    }
+  }
+
+  @Test
+  @Timeout(10)
+  public void acquireForNullINodeReturnsEmpty() {
+    QuotaLocks pool = new QuotaLocks();
+    try (QuotaLocks.LockedQuota handle = pool.acquireForINode(null)) {
+      assertSame(QuotaLocks.LockedQuota.EMPTY, handle,
+          "null INode must yield the EMPTY handle");
+    }
+  }
+
+  @Test
+  @Timeout(10)
+  public void removeDropsLockEntry() {
+    QuotaLocks pool = new QuotaLocks();
+    pool.getLockForTest(123L);
+    assertEquals(1, pool.size(),
+        "lock should be present after lazy creation");
+    pool.remove(123L);
+    assertEquals(0, pool.size(),
+        "remove must drop the entry from the pool");
+    // Re-acquiring after remove should create a fresh lock.
+    ReentrantLock fresh = pool.getLockForTest(123L);
+    assertNotNull(fresh);
+    assertEquals(1, pool.size());
+  }
+
+  @Test
+  @Timeout(10)
+  public void removeNonexistentIdIsNoop() {
+    QuotaLocks pool = new QuotaLocks();
+    pool.remove(404L); // never inserted
+    assertEquals(0, pool.size());
   }
 
   /**
    * Two threads each acquire and hold the same lock; the second waits
-   * until the first releases. Verifies the pool actually serialises
+   * until the first releases. Verifies the pool actually serializes
    * concurrent writers on the same INode.
    */
   @Test
@@ -102,44 +148,51 @@ public class TestQuotaLocks {
     final CountDownLatch firstHolderAcquired = new CountDownLatch(1);
     final CountDownLatch secondHolderDone = new CountDownLatch(1);
 
-    Future<?> first = Executors.newSingleThreadExecutor().submit(() -> {
-      lock.lock();
-      firstHolderAcquired.countDown();
-      try {
-        // Hold the lock long enough for the second thread to attempt
-        // acquisition and block on it.
-        Thread.sleep(50);
-        // First thread releases at ordering=1.
-        assertEquals(0, ordering.getAndIncrement());
-      } catch (InterruptedException ie) {
-        Thread.currentThread().interrupt();
-      } finally {
-        lock.unlock();
-      }
-      return null;
-    });
-
-    Future<?> second = Executors.newSingleThreadExecutor().submit(() -> {
-      try {
-        firstHolderAcquired.await(5, TimeUnit.SECONDS);
+    ExecutorService exec = Executors.newFixedThreadPool(2);
+    try {
+      Future<?> first = exec.submit(() -> {
         lock.lock();
+        firstHolderAcquired.countDown();
         try {
-          // Second thread acquires only after first releases →
-          // ordering must already be 1.
-          assertEquals(1, ordering.getAndIncrement());
+          // Hold the lock long enough for the second thread to attempt
+          // acquisition and block on it.
+          Thread.sleep(50);
+          // First thread releases at ordering=1.
+          assertEquals(0, ordering.getAndIncrement());
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
         } finally {
           lock.unlock();
-          secondHolderDone.countDown();
         }
-      } catch (InterruptedException ie) {
-        Thread.currentThread().interrupt();
-      }
-      return null;
-    });
+        return null;
+      });
 
-    first.get(10, TimeUnit.SECONDS);
-    second.get(10, TimeUnit.SECONDS);
-    assertTrue(secondHolderDone.await(1, TimeUnit.SECONDS));
+      Future<?> second = exec.submit(() -> {
+        try {
+          firstHolderAcquired.await(5, TimeUnit.SECONDS);
+          lock.lock();
+          try {
+            // Second thread acquires only after first releases →
+            // ordering must already be 1.
+            assertEquals(1, ordering.getAndIncrement());
+          } finally {
+            lock.unlock();
+            secondHolderDone.countDown();
+          }
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+        }
+        return null;
+      });
+
+      first.get(10, TimeUnit.SECONDS);
+      second.get(10, TimeUnit.SECONDS);
+      assertTrue(secondHolderDone.await(1, TimeUnit.SECONDS));
+    } finally {
+      exec.shutdown();
+      assertTrue(exec.awaitTermination(5, TimeUnit.SECONDS),
+          "executor should terminate cleanly");
+    }
     assertEquals(2, ordering.get(),
         "exactly two writers should have entered the critical section");
   }

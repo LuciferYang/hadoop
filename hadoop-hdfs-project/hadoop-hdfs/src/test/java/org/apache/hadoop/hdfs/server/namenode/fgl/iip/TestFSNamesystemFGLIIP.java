@@ -3827,9 +3827,10 @@ public class TestFSNamesystemFGLIIP {
       out.write(new byte[1]);
     }
     Path overPath = new Path(quotaDir, "over");
-    // The Mini cluster runs in-process so the QuotaExceededException
-    // surfaces as a direct IOException rather than a wrapped
-    // RemoteException — assert on the IOException's class name.
+    // The exception type and wrapping vary by code path
+    // (NSQuotaExceededException directly, or a RemoteException
+    // wrapping one) — assert on the message / simple-name signal
+    // rather than nailing down a specific class.
     IOException thrown = assertThrows(IOException.class,
         () -> {
           try (FSDataOutputStream out = fs.create(overPath, true, 4096,
