@@ -3761,5 +3761,89 @@ public class TestFSNamesystemFGLIIP {
     assertNotNull(inode, "INode for " + p + " not found");
     return inode.getLocalStoragePolicyID();
   }
+
+  // ======================================================================
+  // HDFS-17386 Phase III / Track P.2 (HDFS-17473): per-feature QuotaLocks.
+  //
+  // Before P.2 the pilot envelope rejected any path whose ancestor had
+  // a quota — FSDirectory.updateCount needed the FS write lock to keep
+  // the verify-quota → update-usage critical section atomic. After P.2
+  // FSDirectory now acquires the per-DirectoryWithQuotaFeature lock via
+  // QuotaLocks, so the pilot can run with quota-bearing ancestors and
+  // the envelope no longer rejects them.
+  // ======================================================================
+
+  @Test
+  @Timeout(60)
+  public void mkdirsUnderAncestorQuotaSucceeds() throws Exception {
+    // Create a quota-bearing ancestor and exercise a create-class
+    // pilot RPC under it. After P.2 this should NOT throw — the pilot
+    // path acquires the ancestor's quota lock, verifies, and updates.
+    Path quotaDir = new Path("/q-mkdirs-parent");
+    fs.mkdirs(quotaDir);
+    fs.setQuota(quotaDir, 100L, HdfsConstants.QUOTA_DONT_SET);
+
+    Path child = new Path(quotaDir, "sub");
+    assertTrue(fs.mkdirs(child),
+        "mkdirs under quota ancestor must succeed via the pilot");
+    assertTrue(fs.exists(child));
+  }
+
+  @Test
+  @Timeout(60)
+  public void createUnderAncestorQuotaConsumesNamespace() throws Exception {
+    // Verify quota usage actually counts up under the pilot path —
+    // confirms the verify+update happened inside the QuotaLocks
+    // section, not skipped because of an envelope miss.
+    Path quotaDir = new Path("/q-create-track");
+    fs.mkdirs(quotaDir);
+    fs.setQuota(quotaDir, 100L, HdfsConstants.QUOTA_DONT_SET);
+    long before = fs.getQuotaUsage(quotaDir).getFileAndDirectoryCount();
+
+    Path p = new Path(quotaDir, "file");
+    try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1, 4096L)) {
+      out.write(new byte[8]);
+    }
+    long after = fs.getQuotaUsage(quotaDir).getFileAndDirectoryCount();
+    assertTrue(after > before,
+        "namespace usage must increase after file creation under quota "
+            + "ancestor; before=" + before + " after=" + after);
+  }
+
+  @Test
+  @Timeout(60)
+  public void namespaceQuotaExceededStillThrows() throws Exception {
+    // Tightest-budget quota: namespace=2 (the directory itself counts
+    // as 1; one extra child fills the budget). Creating a second
+    // child must throw NSQuotaExceededException, even via the pilot
+    // path. Confirms the verify half of verify+update still bites.
+    Path quotaDir = new Path("/q-tight");
+    fs.mkdirs(quotaDir);
+    fs.setQuota(quotaDir, 2L, HdfsConstants.QUOTA_DONT_SET);
+
+    Path okPath = new Path(quotaDir, "ok");
+    try (FSDataOutputStream out = fs.create(okPath, true, 4096,
+        (short) 1, 4096L)) {
+      out.write(new byte[1]);
+    }
+    Path overPath = new Path(quotaDir, "over");
+    // The Mini cluster runs in-process so the QuotaExceededException
+    // surfaces as a direct IOException rather than a wrapped
+    // RemoteException — assert on the IOException's class name.
+    IOException thrown = assertThrows(IOException.class,
+        () -> {
+          try (FSDataOutputStream out = fs.create(overPath, true, 4096,
+              (short) 1, 4096L)) {
+            out.write(new byte[1]);
+          }
+        });
+    assertTrue(thrown.getClass().getSimpleName()
+        .contains("QuotaExceededException")
+        || (thrown.getMessage() != null
+            && thrown.getMessage().contains("Quota")),
+        "expected a quota-exceeded exception, got: "
+            + thrown.getClass().getName() + ": "
+            + thrown.getMessage());
+  }
 }
 

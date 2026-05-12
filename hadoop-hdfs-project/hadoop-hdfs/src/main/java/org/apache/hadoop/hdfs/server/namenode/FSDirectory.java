@@ -60,6 +60,7 @@ import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
 import org.apache.hadoop.hdfs.server.namenode.INode.BlocksMapUpdateInfo.UpdatedReplicationInfo;
+import org.apache.hadoop.hdfs.server.namenode.fgl.QuotaLocks;
 import org.apache.hadoop.hdfs.server.namenode.sps.StoragePolicySatisfyManager;
 import org.apache.hadoop.hdfs.util.ByteArray;
 import org.apache.hadoop.hdfs.util.EnumCounters;
@@ -158,6 +159,14 @@ public class FSDirectory implements Closeable {
 
   INodeDirectory rootDir;
   private final FSNamesystem namesystem;
+  /**
+   * Per-{@code DirectoryWithQuotaFeature} mutex pool. Provides
+   * atomicity for the {@code verify-quota → update-usage} pattern when
+   * the FS write lock is not held — i.e., under the FGL_IIP pilot
+   * (HDFS-17386 Phase III / Track P.2, HDFS-17473). Under legacy mode
+   * the pool is still consulted but is effectively uncontended.
+   */
+  private final QuotaLocks quotaLocks = new QuotaLocks();
   private volatile boolean skipQuotaCheck = false; //skip while consuming edits
   private final int maxComponentLength;
   private volatile int maxDirItems;
@@ -1008,8 +1017,14 @@ public class FSDirectory implements Closeable {
     for (Map.Entry<INodeDirectory, QuotaCounts> entry :
         quotaDelta.getQuotaDirMap().entrySet()) {
       INodeDirectory quotaDir = entry.getKey();
-      quotaDir.getDirectoryWithQuotaFeature().addSpaceConsumed2Cache(
-          entry.getValue().negation());
+      // Track P.2 (HDFS-17473): hold the per-feature quota lock across
+      // the direct usage mutation — paired with the verify+update
+      // critical section in the unified updateCount.
+      try (QuotaLocks.LockedQuota ignored =
+          quotaLocks.acquireForINode(quotaDir)) {
+        quotaDir.getDirectoryWithQuotaFeature().addSpaceConsumed2Cache(
+            entry.getValue().negation());
+      }
     }
   }
 
@@ -1024,7 +1039,14 @@ public class FSDirectory implements Closeable {
         !inode.isInLatestSnapshot(iip.getLatestSnapshotId())) {
       QuotaCounts counts = quotaCounts.orElseGet(() ->
           inode.computeQuotaUsage(getBlockStoragePolicySuite()));
-      unprotectedUpdateCount(iip, iip.length() - 1, counts.negation());
+      // Track P.2 (HDFS-17473): hold quota locks across the direct
+      // unprotectedUpdateCount call — verify is skipped here (delete
+      // can never violate quota) but the usage mutation still races
+      // with concurrent verify+update under FGL_IIP without the lock.
+      try (QuotaLocks.LockedQuota ignored =
+          quotaLocks.acquireForIIP(iip, iip.length() - 1)) {
+        unprotectedUpdateCount(iip, iip.length() - 1, counts.negation());
+      }
     }
   }
 
@@ -1077,10 +1099,16 @@ public class FSDirectory implements Closeable {
     if (numOfINodes > iip.length()) {
       numOfINodes = iip.length();
     }
-    if (checkQuota && !skipQuotaCheck) {
-      verifyQuota(iip, numOfINodes, counts, null);
+    // HDFS-17386 Phase III / Track P.2 (HDFS-17473): hold the per-
+    // quota-feature locks across verify+update so the two halves stay
+    // atomic when the FS write lock is not held (FGL_IIP pilot).
+    try (QuotaLocks.LockedQuota ignored =
+        quotaLocks.acquireForIIP(iip, numOfINodes)) {
+      if (checkQuota && !skipQuotaCheck) {
+        verifyQuota(iip, numOfINodes, counts, null);
+      }
+      unprotectedUpdateCount(iip, numOfINodes, counts);
     }
-    unprotectedUpdateCount(iip, numOfINodes, counts);
   }
   
   /** 
