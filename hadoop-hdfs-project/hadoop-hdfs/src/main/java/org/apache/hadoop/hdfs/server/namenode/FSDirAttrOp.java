@@ -667,7 +667,7 @@ public class FSDirAttrOp {
     }
     XAttrStorage.updateINodeXAttrs(inode, newXAttrs, iip.getLatestSnapshotId());
 
-    // HDFS-17386 Phase III / Track P.6 (HDFS-17505): eagerly propagate
+    // HDFS-17386 Phase III / Track P.3 (HDFS-17505): eagerly propagate
     // the effective storage policy to every descendant file. After this
     // walk INodeFile.getStoragePolicyID() can short-circuit on the local
     // header field, and BlockManager no longer needs to hold an FS lock
@@ -691,9 +691,18 @@ public class FSDirAttrOp {
    * policy. Descendant directories that carry their own explicit
    * XAttr policy override the inherited value for THEIR subtree.
    *
-   * <p>References and symlinks are skipped. Snapshots are honoured via
+   * <p>References and symlinks are skipped. Snapshots are honored via
    * {@link INodeFile#setStoragePolicyID(byte, int)} which records
    * modification against {@code latestSnapshotId}.
+   *
+   * <p><b>Cost.</b> O(subtree). The whole recursion executes under
+   * the lock held by the caller (FS write lock today; an IIP write
+   * lock once the pilot covers {@code setStoragePolicy}). A
+   * {@code setStoragePolicy} call on a directory with millions of
+   * descendants therefore stalls other writers for the duration —
+   * this is the intentional trade-off accepted by HDFS-17505 in
+   * exchange for making BlockManager's storage-policy reads
+   * lock-free.
    *
    * @param dir                  directory whose descendants to update
    * @param dirEffectivePolicy   effective policy seen by descendants

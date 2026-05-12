@@ -54,6 +54,9 @@ import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+import org.apache.hadoop.hdfs.server.namenode.FSDirectory;
+import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+import org.apache.hadoop.hdfs.server.namenode.INode;
 import org.apache.hadoop.hdfs.server.namenode.fgl.FSNLockManager;
 import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -3617,13 +3620,13 @@ public class TestFSNamesystemFGLIIP {
   }
 
   // ======================================================================
-  // HDFS-17386 Phase III / Track P.6 (HDFS-17505): eager storage-policy
+  // HDFS-17386 Phase III / Track P.3 (HDFS-17505): eager storage-policy
   // propagation.
   //
-  // Before P.6 the pilot envelope rejected any path whose ancestor had
+  // Before P.3 the pilot envelope rejected any path whose ancestor had
   // a non-default storage policy — INodeFile.getStoragePolicyID() walked
   // ancestors under the FS lock and that walk was not safe under the
-  // narrow IIP locks. After P.6 setStoragePolicy / unsetStoragePolicy /
+  // narrow IIP locks. After P.3 setStoragePolicy / unsetStoragePolicy /
   // rename eagerly stamp the effective policy onto every descendant
   // file, so the file's local header always carries the policy and
   // BlockManager can read it without walking — and the envelope no
@@ -3667,7 +3670,7 @@ public class TestFSNamesystemFGLIIP {
   public void newFileInheritsLocalStoragePolicyAtCreation()
       throws Exception {
     // Set WARM on the directory, then create a file inside. The new
-    // file's LOCAL policy must be WARM, not UNSPECIFIED — pre-P.6 only
+    // file's LOCAL policy must be WARM, not UNSPECIFIED — pre-P.3 only
     // COPY_ON_CREATE policies (e.g. LAZY_PERSIST) were copied down.
     Path dir = new Path("/sp-inherit");
     fs.mkdirs(dir);
@@ -3713,18 +3716,48 @@ public class TestFSNamesystemFGLIIP {
         "file should be HOT after rename into hot dir");
   }
 
+  @Test
+  @Timeout(60)
+  public void unsetStoragePolicyPropagatesGrandAncestorPolicy()
+      throws Exception {
+    // Build /sp-unset (WARM) / sub (HOT) / file. After unsetStoragePolicy
+    // on the middle directory, every descendant file must fall back to
+    // the grand-ancestor's WARM — exercises
+    // FSDirAttrOp.inheritedStoragePolicyFromAncestors.
+    Path grand = new Path("/sp-unset");
+    Path sub = new Path(grand, "sub");
+    fs.mkdirs(sub);
+    fs.setStoragePolicy(grand, HdfsConstants.WARM_STORAGE_POLICY_NAME);
+    fs.setStoragePolicy(sub, HdfsConstants.HOT_STORAGE_POLICY_NAME);
+
+    Path file = new Path(sub, "file");
+    try (FSDataOutputStream out = fs.create(file)) {
+      out.write(new byte[4]);
+    }
+    assertEquals(HdfsConstants.HOT_STORAGE_POLICY_ID,
+        readLocalStoragePolicy(file),
+        "file should inherit HOT from its direct parent before unset");
+
+    // Unset the middle directory's policy — descendants should now
+    // pick up the grand-ancestor's WARM.
+    fs.unsetStoragePolicy(sub);
+
+    assertEquals(HdfsConstants.WARM_STORAGE_POLICY_ID,
+        readLocalStoragePolicy(file),
+        "after unsetStoragePolicy on parent, file should fall back to "
+            + "grand-ancestor's WARM");
+  }
+
   /**
    * Read the file's LOCAL storage-policy ID (i.e., the value stamped
    * on its own INodeFile header). Distinct from the effective policy
-   * returned by {@code getStoragePolicy}, which on pre-P.6 trunk
+   * returned by {@code getStoragePolicy}, which on pre-P.3 trunk
    * would walk ancestors when the local field is UNSPECIFIED.
    */
   private byte readLocalStoragePolicy(Path p) throws Exception {
-    org.apache.hadoop.hdfs.server.namenode.FSNamesystem fsn =
-        cluster.getNameNode().getNamesystem();
-    org.apache.hadoop.hdfs.server.namenode.FSDirectory dir = fsn.getFSDirectory();
-    org.apache.hadoop.hdfs.server.namenode.INode inode =
-        dir.getINode(p.toUri().getPath());
+    FSNamesystem fsn = cluster.getNameNode().getNamesystem();
+    FSDirectory dir = fsn.getFSDirectory();
+    INode inode = dir.getINode(p.toUri().getPath());
     assertNotNull(inode, "INode for " + p + " not found");
     return inode.getLocalStoragePolicyID();
   }

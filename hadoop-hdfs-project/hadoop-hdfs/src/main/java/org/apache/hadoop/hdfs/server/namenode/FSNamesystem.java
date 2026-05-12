@@ -2261,8 +2261,10 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    *       the right {@code FileNotFoundException});</li>
    *   <li>no ancestor snapshot involvement (setPermission with a
    *       non-CURRENT snapshot id is out of pilot scope);</li>
-   *   <li>no ancestor has quota or non-default storage policy (mirrors
-   *       create-class envelope for consistency).</li>
+   *   <li>no ancestor has a quota (mirrors create-class envelope for
+   *       consistency). Storage policy on ancestors is fine after P.3
+   *       — eager propagation in FSDirAttrOp keeps each file's local
+   *       header up to date.</li>
    * </ul>
    *
    * @throws UnresolvedPathException on symlink in ancestor position
@@ -2284,7 +2286,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "setPermission: ancestor has snapshot/quota/storage-policy "
+            "setPermission: ancestor has snapshot/quota "
                 + src);
       }
       return FSDirAttrOp.setPermission(dir, pc, iip, permission);
@@ -2356,7 +2358,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "setOwner: ancestor has snapshot/quota/storage-policy " + src);
+            "setOwner: ancestor has snapshot/quota " + src);
       }
       return FSDirAttrOp.setOwner(dir, pc, iip, username, group);
     }
@@ -2649,7 +2651,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "setTimes: ancestor has snapshot/quota/storage-policy " + src);
+            "setTimes: ancestor has snapshot/quota " + src);
       }
       return FSDirAttrOp.setTimes(dir, pc, iip, mtime, atime);
     }
@@ -2742,7 +2744,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "truncate: ancestor has snapshot/quota/storage-policy " + src);
+            "truncate: ancestor has snapshot/quota " + src);
       }
       // BM write lock nested under PATH_WRITE — same pattern as
       // setReplication. Truncate mutates BM state via
@@ -2921,7 +2923,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "setReplication: ancestor has snapshot/quota/storage-policy "
+            "setReplication: ancestor has snapshot/quota "
                 + src);
       }
       // BM write lock acquired UNDER PATH_WRITE; released BEFORE
@@ -3046,7 +3048,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "setStoragePolicy: ancestor has snapshot/quota/storage-policy "
+            "setStoragePolicy: ancestor has snapshot/quota "
                 + src);
       }
       return FSDirAttrOp.setStoragePolicy(dir, pc, blockManager, iip, policyId);
@@ -3177,7 +3179,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "unsetStoragePolicy: ancestor has snapshot/quota/storage-policy "
+            "unsetStoragePolicy: ancestor has snapshot/quota "
                 + src);
       }
       return FSDirAttrOp.setStoragePolicy(dir, pc, blockManager, iip,
@@ -3522,8 +3524,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowCreate(iip)) {
         throw new PilotEnvelopeMissException(
-            "startFile: ancestor has quota or non-default storage policy "
-                + src);
+            "startFile: ancestor has quota " + src);
       }
       if (iip.getLastINode() != null) {
         throw new PilotEnvelopeMissException(
@@ -3823,7 +3824,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "append: ancestor has snapshot/quota/storage-policy " + src);
+            "append: ancestor has snapshot/quota " + src);
       }
       writeLock(RwLockMode.BM);
       try {
@@ -4346,7 +4347,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(srcIIP) || !ancestorsAllowMutate(dstIIP)) {
         throw new PilotEnvelopeMissException(
-            "rename: ancestor has snapshot/quota/storage-policy "
+            "rename: ancestor has snapshot/quota "
                 + src + " → " + dst);
       }
       if (srcIIP.getLastINode() == null) {
@@ -4474,7 +4475,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "delete: ancestor has snapshot/quota/storage-policy " + src);
+            "delete: ancestor has snapshot/quota " + src);
       }
 
       // Target must exist and be a regular file. Directories,
@@ -4543,7 +4544,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "delete -r: ancestor has snapshot/quota/storage-policy " + src);
+            "delete -r: ancestor has snapshot/quota " + src);
       }
       // Target snapshot check (the target directory itself may be
       // a snapshot root or have the WithSnapshot feature).
@@ -4984,13 +4985,17 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
   /**
    * Shared Phase-B structural check for create-class pilot RPCs
    * ({@code startFile}, {@code mkdirs}). Returns {@code true} only if
-   * every ancestor directory on the IIP has default storage policy
-   * and no quota. A non-{@code CURRENT} snapshot on an ancestor is
-   * tolerable here: the new INode being created isn't in any snapshot,
-   * so snapshot bookkeeping has no work to do.
+   * no ancestor directory on the IIP has a quota. A non-{@code CURRENT}
+   * snapshot on an ancestor is tolerable here: the new INode being
+   * created isn't in any snapshot, so snapshot bookkeeping has no work
+   * to do.
    *
    * <p>Returns {@code false} signals the caller to fall through to
-   * the legacy path (which handles quota / storage policy correctly).
+   * the legacy path (which handles quota correctly).
+   *
+   * <p>Storage policy is NO LONGER an envelope concern after P.3
+   * (HDFS-17505) — eager propagation in FSDirAttrOp stamps the
+   * effective policy onto every descendant file's local header.
    *
    * <p><b>Not a copy-paste target for mutate-class RPCs.</b> If you
    * are adding a new RPC that modifies an existing INode (setXxx,
@@ -5014,7 +5019,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
         if (ad.isWithQuota()) {
           return false;
         }
-        // HDFS-17386 Phase III / Track P.6 (HDFS-17505): a non-default
+        // HDFS-17386 Phase III / Track P.3 (HDFS-17505): a non-default
         // ancestor storage policy is no longer an envelope miss. Eager
         // propagation in FSDirAttrOp.setDirStoragePolicy + the file-
         // creation path stamps the effective policy onto every
@@ -5029,11 +5034,15 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
    * Shared Phase-B structural check for mutate-class pilot RPCs
    * ({@code delete}, {@code setPermission}, {@code setOwner},
    * {@code setTimes}, {@code setReplication}). Rejects any ancestor
-   * that has a snapshot feature, quota, or non-default storage policy.
-   * Snapshot involvement changes the semantics of
-   * {@code recordModification} — mutations under a snapshottable or
-   * snapshot-bearing ancestor participate in snapshot bookkeeping
-   * that the pilot's narrow lock does not cover.
+   * that has a snapshot feature or quota. Snapshot involvement changes
+   * the semantics of {@code recordModification} — mutations under a
+   * snapshottable or snapshot-bearing ancestor participate in snapshot
+   * bookkeeping that the pilot's narrow lock does not cover.
+   *
+   * <p>Storage policy is NO LONGER an envelope concern after P.3
+   * (HDFS-17505) — eager propagation in FSDirAttrOp stamps the
+   * effective policy onto every descendant file's local header so the
+   * pilot's narrow IIP locks are sufficient for storage-policy reads.
    *
    * <p><b>Not a copy-paste target for create-class RPCs.</b> If you
    * are adding a new RPC that creates a new INode (startFile,
@@ -5059,7 +5068,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
         if (ad.isWithQuota()) {
           return false;
         }
-        // HDFS-17386 Phase III / Track P.6 (HDFS-17505): non-default
+        // HDFS-17386 Phase III / Track P.3 (HDFS-17505): non-default
         // ancestor storage policy is no longer an envelope miss — see
         // ancestorsAllowCreate's comment for the propagation story.
       }
@@ -5160,8 +5169,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowCreate(iip)) {
         throw new PilotEnvelopeMissException(
-            "mkdirs: ancestor has quota or non-default storage policy "
-                + src);
+            "mkdirs: ancestor has quota " + src);
       }
 
       // Permission checks: traversal (execute) on every ancestor PLUS
@@ -9923,7 +9931,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "ACL op: ancestor has snapshot/quota/storage-policy " + src);
+            "ACL op: ancestor has snapshot/quota " + src);
       }
       return aclAction.apply(iip);
     }
@@ -10691,7 +10699,7 @@ public class FSNamesystem implements Namesystem, FSNamesystemMBean,
       }
       if (!ancestorsAllowMutate(iip)) {
         throw new PilotEnvelopeMissException(
-            "xattr write: ancestor has snapshot/quota/storage-policy " + src);
+            "xattr write: ancestor has snapshot/quota " + src);
       }
       return action.apply(iip);
     }

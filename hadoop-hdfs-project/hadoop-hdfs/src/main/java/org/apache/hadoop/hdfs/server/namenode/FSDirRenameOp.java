@@ -88,7 +88,20 @@ class FSDirRenameOp {
     BlockStoragePolicySuite bsps = fsd.getBlockStoragePolicySuite();
     // Assume dstParent existence check done by callers.
     INode dstParent = dst.getINode(-2);
-    // Use the destination parent's storage policy for quota delta verify.
+    // Use the destination parent's storage policy for quota delta verify
+    // unless the source INode has its own explicitly-set local policy.
+    //
+    // HDFS-17386 Phase III / Track P.3 caveat: eager propagation makes
+    // an inherited local indistinguishable from an explicitly-set local,
+    // so this branch can take the "src has explicit policy" path for
+    // files that inherited the policy from an ancestor. This means a
+    // cross-policy rename's quota check uses the source's effective
+    // policy rather than the destination's, which can cause the check
+    // to miss a violation when src and dst types differ (see
+    // TestQuota.testRename for the regressing scenario). Preserving
+    // the existing logic keeps HDFS-16428's per-file explicit-policy
+    // behavior intact; a follow-up could introduce an explicit-bit on
+    // INodeFile to restore strict quota enforcement under P.3.
     final boolean isSrcSetSp = src.getLastINode().isSetStoragePolicy();
     final byte storagePolicyID = isSrcSetSp ?
         src.getLastINode().getLocalStoragePolicyID() :
@@ -239,8 +252,11 @@ class FSDirRenameOp {
         }
 
         tx.updateMtimeAndLease(timestamp);
-        tx.updateQuotasInSourceTree(fsd.getBlockStoragePolicySuite());
+        // Repropagate BEFORE updateQuotasInSourceTree so quota counts
+        // computed via INodeFile.computeQuotaUsage see the post-rename
+        // storage policy (matches the order in the POSIX rename below).
         repropagateStoragePolicyAfterRename(renamedIIP);
+        tx.updateQuotasInSourceTree(fsd.getBlockStoragePolicySuite());
 
         return renamedIIP;
       }
@@ -927,17 +943,21 @@ class FSDirRenameOp {
   }
 
   /**
-   * HDFS-17386 Phase III / Track P.6 (HDFS-17505): after a successful
+   * HDFS-17386 Phase III / Track P.3 (HDFS-17505): after a successful
    * rename, push the destination's effective storage policy onto every
    * file in the moved subtree so {@link INodeFile#getStoragePolicyID()}
    * can short-circuit on the local header. BlockManager then reads the
    * file's policy without walking the parent chain — the read no
    * longer needs an FS-lock.
    *
-   * <p>Semantic change from the pre-P.6 lazy model: a file's effective
-   * policy now follows its current location, even if a previous
-   * setStoragePolicy on the file itself recorded an explicit value.
-   * Per HDFS-17505 this is the intended trade-off.
+   * <p>Semantic change from the pre-P.3 lazy-walk model: a file's
+   * effective policy now follows its current location, even if a
+   * previous {@code setStoragePolicy} on the file itself had recorded
+   * an explicit per-file value. The local header is unconditionally
+   * overwritten with the destination parent's effective policy. Per
+   * HDFS-17505 this is the intended trade-off — the alternative would
+   * be to track an "is-explicit" bit per INodeFile, which would
+   * require expanding the packed header.
    */
   private static void repropagateStoragePolicyAfterRename(
       INodesInPath renamedIIP) throws QuotaExceededException {

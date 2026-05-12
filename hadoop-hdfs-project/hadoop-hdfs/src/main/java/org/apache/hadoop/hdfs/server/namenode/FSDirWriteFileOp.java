@@ -857,7 +857,7 @@ class FSDirWriteFileOp {
       inode.setStoragePolicyID(lpPolicy.getId(),
                                  iip.getLatestSnapshotId());
     } else {
-      // HDFS-17386 Phase III / Track P.6 (HDFS-17505): if any ancestor
+      // HDFS-17386 Phase III / Track P.3 (HDFS-17505): if any ancestor
       // has an explicit storage policy, eagerly copy that effective
       // policy onto the newly-created file. INodeFile.getStoragePolicyID()
       // can then return the local field directly — BlockManager no
@@ -867,8 +867,8 @@ class FSDirWriteFileOp {
       // When NO ancestor has an explicit policy, leave the file's
       // local as UNSPECIFIED — the file is genuinely "policy not set"
       // and a future setStoragePolicy on an ancestor will reach it
-      // through propagateStoragePolicyToDescendantFiles. Pre-P.6
-      // behaviour copied down only for COPY_ON_CREATE policies (e.g.
+      // through propagateStoragePolicyToDescendantFiles. Pre-P.3
+      // behavior copied down only for COPY_ON_CREATE policies (e.g.
       // LAZY_PERSIST) and resolved everything else lazily.
       byte effective = inode.getStoragePolicyID();
       if (effective != HdfsConstants.BLOCK_STORAGE_POLICY_ID_UNSPECIFIED) {
